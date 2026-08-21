@@ -7,14 +7,13 @@ import * as path from 'path';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
-// Carved-skill aware (v2 plan T9): ship is a skeleton SKILL.md + sections/*.md.
-// Read the union so validations of content that moved into a section still hold.
-// `_SHIP_MD` is a distinct path expression so a mechanical read-replace can't
-// recurse into this helper.
-const _SHIP_MD = path.join(ROOT, 'ship', 'SKILL.md');
-function readShipUnion(): string {
-  let t = fs.readFileSync(_SHIP_MD, 'utf-8');
-  const secDir = path.join(ROOT, 'ship', 'sections');
+// Carved-skill aware (v2 plan T9 / Phase B): a carved skill is a skeleton SKILL.md
+// plus sections/*.md. Read the union so validations of content that moved into a
+// section still hold. For an uncarved skill (no sections dir) this is just the
+// skeleton, so readSkillUnion is safe to use everywhere.
+function readSkillUnion(skill: string): string {
+  let t = fs.readFileSync(path.join(ROOT, skill, 'SKILL.md'), 'utf-8');
+  const secDir = path.join(ROOT, skill, 'sections');
   if (fs.existsSync(secDir)) {
     for (const f of fs.readdirSync(secDir).sort()) {
       if (f.endsWith('.md')) t += '\n' + fs.readFileSync(path.join(secDir, f), 'utf-8');
@@ -22,17 +21,23 @@ function readShipUnion(): string {
   }
   return t;
 }
+function readShipUnion(): string {
+  return readSkillUnion('ship');
+}
 
 describe('SKILL.md command validation', () => {
-  test('all $B commands in SKILL.md are valid browse commands', () => {
+  // P2 (v1.2.0): the top-level gstack skill is a pure ROUTER, not the browse
+  // skill. The browse body lives only in browse/SKILL.md now. This regression
+  // pins the split: the router carries routing rules and zero browse commands,
+  // while browse/SKILL.md still advertises the full QA surface (asserted below).
+  test('top-level SKILL.md is a router with no browse body (P2)', () => {
+    const md = fs.readFileSync(path.join(ROOT, 'SKILL.md'), 'utf-8');
+    expect(md).not.toContain('gstack browse: QA Testing'); // browse body removed
+    expect(md).toContain('## Route first'); // router head present
+    expect(md).toContain('invoke `/investigate`'); // routing rules present
     const result = validateSkill(path.join(ROOT, 'SKILL.md'));
-    expect(result.invalid).toHaveLength(0);
-    expect(result.valid.length).toBeGreaterThan(0);
-  });
-
-  test('all snapshot flags in SKILL.md are valid', () => {
-    const result = validateSkill(path.join(ROOT, 'SKILL.md'));
-    expect(result.snapshotFlagErrors).toHaveLength(0);
+    expect(result.invalid).toHaveLength(0); // no INVALID browse commands
+    expect(result.valid.length).toBe(0); // and no browse commands at all — it routes, not browses
   });
 
   test('all $B commands in browse/SKILL.md are valid browse commands', () => {
@@ -128,6 +133,15 @@ describe('SKILL.md command validation', () => {
     if (!fs.existsSync(skill)) return;
     const result = validateSkill(skill);
     expect(result.snapshotFlagErrors).toHaveLength(0);
+  });
+
+  test('autoplan section skip list includes the scope gate', () => {
+    // autoplan Step 3 reads plan-eng-review / plan-design-review SKILL.md
+    // verbatim; without this skip-list entry it ingests their scope gate — a
+    // hard-STOP AskUserQuestion that contradicts autoplan's auto-decide
+    // contract. Nothing else pins the skip-list contents.
+    const md = fs.readFileSync(path.join(ROOT, 'autoplan', 'SKILL.md'), 'utf-8');
+    expect(md).toContain('- Scope gate (the plan under review is already the target)');
   });
 });
 
@@ -548,8 +562,8 @@ describe('TODOS-format.md reference consistency', () => {
 
   test('skills that write TODOs reference TODOS-format.md', () => {
     const shipContent = readShipUnion();
-    const ceoPlanContent = fs.readFileSync(path.join(ROOT, 'plan-ceo-review', 'SKILL.md'), 'utf-8');
-    const engPlanContent = fs.readFileSync(path.join(ROOT, 'plan-eng-review', 'SKILL.md'), 'utf-8');
+    const ceoPlanContent = readSkillUnion('plan-ceo-review'); // carved: TODOS-format ref moved to section
+    const engPlanContent = readSkillUnion('plan-eng-review');
 
     expect(shipContent).toContain('TODOS-format.md');
     expect(ceoPlanContent).toContain('TODOS-format.md');
@@ -621,7 +635,10 @@ describe('v0.4.1 preamble features', () => {
 // --- Structural tests for new skills ---
 
 describe('office-hours skill structure', () => {
-  const content = fs.readFileSync(path.join(ROOT, 'office-hours', 'SKILL.md'), 'utf-8');
+  // Carved (v2 plan T9): Phase 5 (Design Doc) + Phase 6 (handoff) moved into
+  // sections/design-and-handoff.md, so structural phrases now live there — read
+  // the skeleton+sections union.
+  const content = readSkillUnion('office-hours');
 
   // Original structural assertions
   for (const section of ['Phase 1', 'Phase 2', 'Phase 3', 'Phase 4', 'Phase 5', 'Phase 6',
@@ -832,7 +849,7 @@ describe('Completeness Principle in generated SKILL.md files', () => {
     test(`${skill} contains Completeness Principle section`, () => {
       const content = fs.readFileSync(path.join(ROOT, skill), 'utf-8');
       expect(content).toContain('Completeness Principle');
-      expect(content).toContain('Boil the Lake');
+      expect(content).toContain('Boil the Ocean');
     });
   }
 
@@ -912,8 +929,10 @@ describe('CEO review mode validation', () => {
   });
 
   test('has docs/designs promotion section', () => {
-    expect(content).toContain('docs/designs');
-    expect(content).toContain('PROMOTED');
+    // Carved (v2 plan Phase B): the promotion block moved into the review section.
+    const union = readSkillUnion('plan-ceo-review');
+    expect(union).toContain('docs/designs');
+    expect(union).toContain('PROMOTED');
   });
 
   test('mode quick reference has four columns', () => {
@@ -1197,9 +1216,11 @@ describe('Step 3.4 test coverage audit', () => {
 
 describe('ship step numbering', () => {
   // Allowed sub-steps that are resolver-generated and intentionally nested:
-  // 8.1 (Plan Verification), 8.2 (Scope Drift), 9.1 (Review Army), 9.2 (Findings Merge),
-  // 9.3 (Cross-review dedup), 15.0 (WIP squash — continuous checkpoint), 15.1 (Bisectable commits).
-  const ALLOWED_SUBSTEPS = new Set(['8.1', '8.2', '9.1', '9.2', '9.3', '15.0', '15.1']);
+  // 0.9 (Apple target detection — MUST precede Step 1's branch gate, R2-pinned
+  // by test/ship-apple-gate.test.ts), 8.1 (Plan Verification), 8.2 (Scope
+  // Drift), 9.1 (Review Army), 9.2 (Findings Merge), 9.3 (Cross-review dedup),
+  // 15.0 (WIP squash — continuous checkpoint), 15.1 (Bisectable commits).
+  const ALLOWED_SUBSTEPS = new Set(['0.9', '8.1', '8.2', '9.1', '9.2', '9.3', '15.0', '15.1']);
 
   test('ship/SKILL.md.tmpl contains no unexpected fractional step numbers', () => {
     const tmpl = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md.tmpl'), 'utf-8');
@@ -1379,15 +1400,16 @@ describe('Codex skill', () => {
     expect(content).toContain('Adversarial review (always-on)');
     // Always-on: both Claude and Codex adversarial
     expect(content).toContain('Claude adversarial subagent (always runs)');
-    expect(content).toContain('Codex adversarial challenge (always runs when available)');
+    expect(content).toContain('Codex adversarial challenge (runs whenever');
     // Claude adversarial subagent dispatch
     expect(content).toContain('Agent tool');
     expect(content).toContain('FIXABLE');
     expect(content).toContain('INVESTIGATE');
-    // Codex availability check
-    expect(content).toContain('CODEX_NOT_AVAILABLE');
-    // OLD_CFG only gates Codex, not Claude
-    expect(content).toContain('skip Codex passes only');
+    // Probe-based availability via the shared codexPreflight() (install + auth)
+    expect(content).toContain('CODEX_MODE');
+    expect(content).toContain('command -v codex'); // install check kept literal
+    // codex_reviews=disabled gates Codex passes only; Claude adversarial still runs
+    expect(content).toContain('skip the Codex passes ONLY');
     // Review log
     expect(content).toContain('adversarial-review');
     expect(content).toContain('reasoning_effort="high"');
@@ -1442,12 +1464,75 @@ describe('Codex skill', () => {
     expect(content).toContain('codex exec');
   });
 
+  // D5 regression guard: the Codex outside voice is default-on, not opt-in. A future
+  // gen-skill-docs change must not silently reintroduce the "Want an outside voice?"
+  // AskUserQuestion. The CODEX_PLAN_REVIEW content renders into each skill's
+  // sections/review-sections.md (the skeleton points at it). plan-design-review uses
+  // DESIGN_OUTSIDE_VOICES, not CODEX_PLAN_REVIEW, so it is excluded here.
+  test('plan reviews run the Codex outside voice default-on (no opt-in question)', () => {
+    for (const skill of ['plan-eng-review', 'plan-ceo-review', 'plan-devex-review']) {
+      const content = fs.readFileSync(
+        path.join(ROOT, skill, 'sections', 'review-sections.md'), 'utf-8');
+      expect(content).not.toContain('Want an outside voice');
+      expect(content).toContain('Outside Voice — Independent Plan Challenge (default-on)');
+      expect(content).toContain('CODEX_MODE');
+      expect(content).toContain('command -v codex'); // preflight install check (e2e relies on it)
+    }
+  });
+
+  test('/document-release includes the default-on Codex documentation review', () => {
+    // The doc-review renders into the carved release-body section (kept out of the
+    // always-loaded skeleton to respect the skeleton-byte budget).
+    const content = fs.readFileSync(
+      path.join(ROOT, 'document-release', 'sections', 'release-body.md'), 'utf-8');
+    expect(content).toContain('Codex Documentation Review (default-on)');
+    expect(content).toContain('CODEX_MODE');
+    expect(content).toContain('codex-doc-review');
+  });
+
+  test('codex-host document-release does NOT contain the Codex doc review', () => {
+    // .agents/ is gitignored — generate on demand (codex never invokes itself)
+    Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'codex'], {
+      cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+    });
+    const content = fs.readFileSync(
+      path.join(ROOT, '.agents', 'skills', 'gstack-document-release', 'SKILL.md'), 'utf-8');
+    expect(content).not.toContain('Codex Documentation Review');
+    expect(content).not.toContain('codex-doc-review');
+  });
+
   test('codex review invocations avoid the prompt plus --base argument shape', () => {
+    // The real invariant is "never pass a positional [PROMPT] together with a
+    // scope flag" — the CLI rejects that combination at argv parse time
+    // (#1428, #1479). Two different shapes satisfy it, and these files have
+    // diverged on which one they use:
+    //
+    //   scoped   — `codex review --base <base>` with NO prompt argument. The
+    //     scope comes from the CLI, which is the only thing that actually sets
+    //     it. This is what all three files now use.
+    //   broken   — prompt-only `codex review "<text>"` describing the diff
+    //     range in prose. This parses, but the CLI falls back to *uncommitted
+    //     working-tree* scope, so the review silently covers the wrong changes.
+    //
+    // The old assertion banned the substring `--base <base> -c '...'`, which
+    // the correct scoped form also contains — it could not tell the two apart,
+    // so it effectively banned the fix.
     for (const rel of ['codex/SKILL.md', 'review/SKILL.md', 'ship/SKILL.md']) {
       // ship's codex command moved into sections/adversarial.md (T9 carve).
       const content = rel === 'ship/SKILL.md' ? readShipUnion() : fs.readFileSync(path.join(ROOT, rel), 'utf-8');
-      expect(content).not.toContain('--base <base> -c \'model_reasoning_effort="high"\'');
-      expect(content).toContain('Run git diff origin/<base>...HEAD 2>/dev/null || git diff <base>...HEAD');
+      expect(content).toMatch(/codex\s+review\s+--base\b/);
+      const offending: string[] = [];
+      for (const line of content.split('\n')) {
+        if (line.includes('`codex review`')) continue;
+        const match = line.match(/(?:^|[;&|]\s*|\s)codex\s+review\b(.*)$/);
+        if (!match) continue;
+        const rest = match[1];
+        if (!/--base\b|--commit\b|--uncommitted\b/.test(rest)) continue;
+        const beforeFlag = rest.split(/--base\b|--commit\b|--uncommitted\b/)[0].trim();
+        // A quoted string or variable expansion before the scope flag is the bug.
+        if (/^["'$]|^--\s*["']/.test(beforeFlag)) offending.push(`${rel}: ${line.trim()}`);
+      }
+      expect(offending).toEqual([]);
     }
   });
 
@@ -1455,9 +1540,13 @@ describe('Codex skill', () => {
     // Pre-#1209, the bare `codex review --base` path stripped the filesystem
     // boundary instruction, letting Codex spend tokens reading skill files.
     // #1209's prompt rewrite restored the boundary by routing every default
-    // call through a prompt. Pin both halves so a future refactor can't
-    // regress: (a) the boundary line must appear, (b) the call must be
-    // through `codex review "<prompt>"` not bare `codex review --base`.
+    // call through a prompt — but routing through a prompt is what breaks the
+    // diff scope, so codex/ no longer does that. What this test pins is the
+    // boundary TEXT, which must still be present for the paths that do take a
+    // prompt (`codex exec` for challenge, consult, and custom review focus).
+    // Do NOT "restore" the boundary by putting a prompt argument back on a
+    // scoped `codex review` call: that combination fails to parse, and
+    // dropping the scope flag to make it parse silently reviews the wrong diff.
     const boundaryLine =
       'Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/';
     for (const rel of ['codex/SKILL.md', 'review/SKILL.md', 'ship/SKILL.md']) {
@@ -1676,13 +1765,6 @@ describe('Codex skill validation', () => {
     expect(fs.existsSync(path.join(AGENTS_DIR, 'gstack-codex', 'SKILL.md'))).toBe(false);
   });
 
-  test('/claude skill is external-host-only — no Claude-host variant', () => {
-    // Claude host should not get an outside-voice skill that shells into Claude.
-    expect(fs.existsSync(path.join(ROOT, 'claude', 'SKILL.md'))).toBe(false);
-    // Codex/external hosts should get the generated wrapper.
-    expect(fs.existsSync(path.join(AGENTS_DIR, 'gstack-claude', 'SKILL.md'))).toBe(true);
-  });
-
   test('Codex skill names follow gstack-{name} convention', () => {
     const codexDirs = fs.readdirSync(AGENTS_DIR);
     for (const dir of codexDirs) {
@@ -1815,10 +1897,9 @@ describe('no compiled binaries in git', () => {
     // repository size without blocking those fixtures from living in git.
     // Known-good fixtures are exempted from the warning to keep CI logs clean.
     const MAX_BYTES = 2 * 1024 * 1024;
-    const knownLargeFixtures = new Set([
-      // Deterministic replay fixture for BrowseSafe-Bench. The live bench is
-      // expensive; this file is intentionally committed so the gate is free.
-      'browse/test/fixtures/security-bench-haiku-responses.json',
+    const knownLargeFixtures = new Set<string>([
+      // Currently empty — add repo-relative paths of intentionally-committed
+      // large fixtures here with a reason.
     ]);
     const oversized = trackedFiles.flatMap((f: string) => {
       if (knownLargeFixtures.has(f)) return [];
@@ -1845,11 +1926,6 @@ describe('no compiled binaries in git', () => {
   });
 });
 
-// `sidebar agent (#584)` describe block was here. sidebar-agent.ts and
-// the entire chat-queue path were ripped in favor of the interactive
-// claude PTY (terminal-agent.ts); these assertions had no target file.
-// Terminal-pane invariants are covered by browse/test/sidebar-tabs.test.ts
-// and browse/test/terminal-agent.test.ts.
 
 // ─── Browser-skills validation ──────────────────────────────────
 //

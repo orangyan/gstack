@@ -158,6 +158,11 @@ export function resolveBrowseBin(env: NodeJS.ProcessEnv = process.env): string {
 
 function isExecutable(p: string): boolean {
   try {
+    // Must be a regular FILE. access(X_OK) alone is true for directories — they carry the
+    // execute/traverse bit on POSIX and pass the Windows check too — so discovery happily
+    // "found" ~/.claude/skills/browse, which is the skill's docs folder containing nothing
+    // but SKILL.md, and returned a directory as the browse binary.
+    if (!fs.statSync(p).isFile()) return false;
     fs.accessSync(p, fs.constants.X_OK);
     return true;
   } catch {
@@ -176,6 +181,9 @@ function runBrowse(args: string[]): string {
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,    // 16MB; tab content can be large
       stdio: ["ignore", "pipe", "pipe"],
+      // A wedged daemon (or a hostile mermaid source spinning the renderer)
+      // must fail the run, not hang it forever.
+      timeout: 120_000,
     });
   } catch (err: any) {
     const exitCode = typeof err.status === "number" ? err.status : 1;
@@ -187,16 +195,18 @@ function runBrowse(args: string[]): string {
 }
 
 /**
- * Write a payload to a tmp file and return the path. Used for any payload
- * >4KB to avoid Windows argv limits (Codex round 2 #3).
+ * Temp dir for any file handed to browse (payloads, rendered HTML, PDF output).
  *
  * Path must be under the browse safe-dirs allowlist (/tmp or cwd on
  * non-Windows; os.tmpdir on Windows).  v1.6.0.0 tightened --from-file
  * validation to close a CLI/API parity gap (PR #1103), so os.tmpdir()
  * on macOS (/var/folders/...) now fails validateReadPath.  Use the same
  * TEMP_DIR convention as browse/src/platform.ts.
+ *
+ * Exported because orchestrator.ts and setup.ts write files that browse must
+ * read back; os.tmpdir() there trips the same validateReadPath rejection.
  */
-const PAYLOAD_TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
+export const PAYLOAD_TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
 
 function writePayloadFile(payload: Record<string, unknown>): string {
   const hash = crypto.createHash("sha256")
@@ -269,12 +279,36 @@ export function loadHtml(opts: LoadHtmlOptions): void {
 }
 
 /**
+ * Load an HTML file (already under browse's safe dirs, e.g. /tmp) into a tab
+ * by path. Cheaper than loadHtml for large pages — no JSON payload round-trip;
+ * browse reads the file directly (diagram-render bundle is ~9MB).
+ */
+export function loadHtmlFile(opts: { file: string; tabId: number; waitUntil?: "load" | "domcontentloaded" | "networkidle" }): void {
+  const args = ["load-html", opts.file, "--tab-id", String(opts.tabId)];
+  if (opts.waitUntil) args.push("--wait-until", opts.waitUntil);
+  runBrowse(args);
+}
+
+/**
  * Evaluate a JS expression in a tab. Returns the serialized result as string.
  */
 export function js(opts: JsOptions): string {
   return runBrowse([
     "js",
     opts.expression,
+    "--tab-id", String(opts.tabId),
+  ]).trim();
+}
+
+/**
+ * Evaluate a JS file in a tab (`browse eval <file>`): the argv-safe transport
+ * for expressions too large for a command-line element. The file must live
+ * under browse's safe dirs (/tmp or cwd).
+ */
+export function evalFile(opts: { file: string; tabId: number }): string {
+  return runBrowse([
+    "eval",
+    opts.file,
     "--tab-id", String(opts.tabId),
   ]).trim();
 }
@@ -300,9 +334,11 @@ export function waitForExpression(opts: {
     }
     const wait = Math.min(poll, Math.max(0, deadline - Date.now()));
     if (wait <= 0) break;
-    // Synchronous sleep is fine — this only runs once per PDF render
-    const end = Date.now() + wait;
-    while (Date.now() < end) { /* busy wait */ }
+    // Real sleep, not a busy-wait: this poll now runs on every diagram-render
+    // bundle load (and after every fence render error), exactly while Chromium
+    // is parsing a 9MB page on the same machine — spinning a core competes
+    // with the work being awaited.
+    Bun.sleepSync(wait);
   }
   return false;
 }

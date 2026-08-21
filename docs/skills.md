@@ -48,14 +48,15 @@ Detailed guides for every gstack skill — philosophy, workflow, and examples.
 | [`/sync-gbrain`](#sync-gbrain) | **Keep Brain Current** | Refresh gbrain against this repo's code; teach the agent when to use `gbrain search`/`code-def` over Grep. Idempotent; safe to re-run. |
 | | | |
 | **Safety & Utility** | | |
-| [`/careful`](#safety--guardrails) | **Safety Guardrails** | Warns before destructive commands (rm -rf, DROP TABLE, force-push, git reset --hard). Override any warning. Common build cleanups whitelisted. |
+| [`/careful`](#safety--guardrails) | **Safety Guardrails** | Warns before destructive commands (rm -rf, DROP TABLE, force-push, git reset --hard). Override any MEDIUM warning; root/home recursive deletes and default-branch force-pushes are hard-denied. Common build cleanups whitelisted. |
 | [`/freeze`](#safety--guardrails) | **Edit Lock** | Restrict all file edits to a single directory. Blocks Edit and Write outside the boundary. Accident prevention for debugging. |
 | [`/guard`](#safety--guardrails) | **Full Safety** | Combines /careful + /freeze in one command. Maximum safety for prod work. |
 | [`/unfreeze`](#safety--guardrails) | **Unlock** | Remove the /freeze boundary, allowing edits everywhere again. |
 | [`/open-gstack-browser`](#open-gstack-browser) | **GStack Browser** | Launch GStack Browser with sidebar, anti-bot stealth, auto model routing, cookie import, and Claude Code integration. Watch every action live. |
 | [`/setup-deploy`](#setup-deploy) | **Deploy Configurator** | One-time setup for `/land-and-deploy`. Detects your platform, production URL, and deploy commands. |
 | [`/gstack-upgrade`](#gstack-upgrade) | **Self-Updater** | Upgrade gstack to the latest version. Detects global vs vendored install, syncs both, shows what changed. |
-| [`/make-pdf`](#make-pdf) | **PDF Generator** | Turn any markdown file into a publication-quality PDF. Proper margins, page numbers, cover pages, clickable TOC. |
+| [`/make-pdf`](#make-pdf) | **PDF Generator** | Turn any markdown file into a publication-quality PDF. Proper margins, page numbers, cover pages, clickable TOC. Mermaid/excalidraw fences render as vector diagrams; `--to html\|docx` for other formats. |
+| [`/diagram`](#diagram) | **Diagram Maker** | English in, diagram out: mermaid source + editable `.excalidraw` (open it on excalidraw.com, hand-drawn style) + rendered SVG/PNG. Fully offline. |
 | [`/ios-qa`](#ios-qa) | **iOS QA Lead** | Live-device iOS QA via USB CoreDevice tunnel + embedded StateServer. Reads Swift source, codegens accessors, drives the real iPhone. Optionally exposes the device over Tailscale for remote agents. |
 | [`/ios-fix`](#ios-fix) | **iOS Autonomous Fixer** | Closes the find→fix→verify loop on a real iPhone. Captures a reproducing snapshot, fixes the source, rebuilds, redeploys, verifies. |
 | [`/ios-design-review`](#ios-design-review) | **iOS Designer's Eye** | 10-dimension Apple HIG audit on a real iPhone. Rates each screen, says what would make it a 10. |
@@ -228,6 +229,8 @@ That is `/plan-eng-review`.
 Not "make the idea smaller."
 **Make the idea buildable.**
 
+One note on invocation: in plan mode, the skill skips the "what should I review?" scope question and reviews your active plan automatically, announcing its pick in one line ("Scope gate: plan mode — auto-selected B") so you can redirect it. Name a target explicitly ("review PLAN.md") and your choice wins in any mode. Outside plan mode with nothing named, it asks first — that gate is a hard stop.
+
 ### Review Readiness Dashboard
 
 Every review (CEO, Eng, Design) logs its result. At the end of each review, you see a dashboard:
@@ -262,7 +265,7 @@ Most plans describe what the backend does but never specify what the user actual
 
 `/plan-design-review` catches all of this during planning, when it's cheap to fix.
 
-It works like `/plan-ceo-review` and `/plan-eng-review` — interactive, one issue at a time, with the **STOP + AskUserQuestion** pattern. It rates each design dimension 0-10, explains what a 10 looks like, then edits the plan to get there. The rating drives the work: rate low = lots of fixes, rate high = quick pass.
+It works like `/plan-ceo-review` and `/plan-eng-review` — interactive, one issue at a time, with the **STOP + AskUserQuestion** pattern. It rates each design dimension 0-10, explains what a 10 looks like, then edits the plan to get there. The rating drives the work: rate low = lots of fixes, rate high = quick pass. Like `/plan-eng-review`, it skips the "what should I review?" scope question in plan mode and targets your active plan automatically (announced in one line so you can redirect); an explicitly named target wins in any mode.
 
 Seven passes over the plan: information architecture, interaction state coverage, user journey, AI slop risk, design system alignment, responsive/accessibility, and unresolved design decisions. For each pass, it finds gaps and either fixes them directly (obvious ones) or asks you to make a design choice (genuine tradeoffs).
 
@@ -1057,7 +1060,7 @@ Claude: Running independent Codex review...
 
 ## Safety & Guardrails
 
-Four skills that add safety rails to any Claude Code session. They work via Claude Code's PreToolUse hooks — transparent, session-scoped, no configuration files.
+Four skills that add safety rails to any Claude Code session. They work via Claude Code's PreToolUse hooks — transparent, session-scoped, no configuration required.
 
 ### `/careful`
 
@@ -1073,7 +1076,7 @@ Say "be careful" or run `/careful` when you're working near production, running 
 
 Common build artifact cleanups (`rm -rf node_modules`, `dist`, `.next`, `__pycache__`, `build`, `coverage`) are whitelisted — no false alarms on routine operations.
 
-You can override any warning. The guardrails are accident prevention, not access control.
+You can override any MEDIUM warning. Two catastrophic shapes are hard-denied instead of asked: recursive deletes of the filesystem root or your home directory (including the `/*`, `~/`, and `$HOME/` forms), and force-pushes to the repo's default branch (`--force-with-lease` never triggers the deny; the escape hatch is ending the session-scoped `/careful` session). You can also add your own warn rules — one POSIX ERE per line — in `~/.gstack/careful-patterns.txt` (global) or `~/.gstack/projects/<slug>/careful-patterns.txt` (per-project); custom patterns only ever add warnings, never suppress the built-ins. The guardrails are accident prevention, not access control.
 
 ### `/freeze`
 

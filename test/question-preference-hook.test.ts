@@ -3,15 +3,18 @@
  *
  * Covers:
  *   - never-ask + marker + two-way + clean recommendation → deny+reason
- *   - never-ask + no marker → defer (D18 marker gate)
- *   - never-ask + one-way → defer (safety override)
- *   - never-ask + ambiguous recommendation → defer (D2 refuse-on-ambiguous)
- *   - always-ask → defer
- *   - no preference → defer
+ *   - never-ask + no marker → pass-through (D18 marker gate)
+ *   - never-ask + one-way → pass-through (safety override)
+ *   - never-ask + ambiguous recommendation → pass-through (D2 refuse-on-ambiguous)
+ *   - always-ask → pass-through
+ *   - no preference → pass-through
  *   - project preference wins over global (D8 precedence)
  *   - global preference applies when no project preference set
  *   - mcp__*__AskUserQuestion matcher accepted
- *   - empty stdin → defer (crash safety)
+ *   - empty stdin → pass-through (crash safety)
+ *
+ * Pass-through contract (#2035/#2006): exit 0 + EXACTLY empty stdout, or
+ * additionalContext-only hookSpecificOutput — never a permissionDecision.
  *   - auto-decided event logged via gstack-question-log (PostToolUse won't fire)
  *   - auto-decided marker written to ~/.gstack/sessions/<id>/.auto-decided-<tool_use_id>
  */
@@ -60,7 +63,7 @@ function writeGlobalPref(questionId: string, preference: string): void {
   fs.writeFileSync(f, JSON.stringify(prefs, null, 2));
 }
 
-function runHook(stdin: object, cwd?: string): {
+function runHook(stdin: object, cwd?: string, extraEnv?: Record<string, string>): {
   stdout: string;
   stderr: string;
   status: number;
@@ -72,7 +75,15 @@ function runHook(stdin: object, cwd?: string): {
   }
   env.GSTACK_STATE_ROOT = stateRoot;
   delete env.GSTACK_HOME;
+  // Strip ambient Conductor markers so these cases characterize NON-Conductor
+  // behavior deterministically — otherwise running the suite inside Conductor
+  // (CONDUCTOR_WORKSPACE_PATH/PORT set) would flip every defer into the
+  // [conductor] prose deny. The Conductor cases below opt back in explicitly
+  // via extraEnv.
+  delete env.CONDUCTOR_WORKSPACE_PATH;
+  delete env.CONDUCTOR_PORT;
   env.GSTACK_QUESTION_LOG_NO_DERIVE = '1';
+  if (extraEnv) Object.assign(env, extraEnv);
   const res = spawnSync(HOOK, [], {
     env,
     input: JSON.stringify({ ...stdin, cwd: cwd || fixtureCwd }),
@@ -87,6 +98,20 @@ function runHook(stdin: object, cwd?: string): {
     status: res.status ?? -1,
     parsed,
   };
+}
+
+/**
+ * #2035/#2006 contract: pass-through (abstain) is exit 0 with EXACTLY empty
+ * stdout — never a permissionDecision. 'defer' is a real PreToolUse value,
+ * but its semantics are pause-for-external-resumption (CC v2.1.89+), so
+ * emitting it orphans the tool call in interactive sessions. Exact-empty
+ * (not trim) is deliberate: whitespace on stdout is still hook output, and a
+ * garbage/partial write must fail this assertion rather than slip past an
+ * optional-chained parse.
+ */
+function expectPassThrough(r: { status: number; stdout: string }): void {
+  expect(r.status).toBe(0);
+  expect(r.stdout).toBe('');
 }
 
 function autoDecidedEvents(): Array<Record<string, unknown>> {
@@ -105,8 +130,8 @@ function autoDecidedEvents(): Array<Record<string, unknown>> {
 // Defer paths
 // ----------------------------------------------------------------------
 
-describe('defers (no enforcement)', () => {
-  test('no preference set → defer', () => {
+describe('passes through (no enforcement)', () => {
+  test('no preference set → pass-through (empty stdout, no permissionDecision)', () => {
     const r = runHook({
       session_id: 's1',
       tool_name: 'AskUserQuestion',
@@ -117,11 +142,10 @@ describe('defers (no enforcement)', () => {
         ],
       },
     });
-    expect(r.status).toBe(0);
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
   });
 
-  test('marker missing → defer (D18)', () => {
+  test('marker missing → pass-through (D18)', () => {
     writeProjectPref('test-q', 'never-ask');
     const r = runHook({
       session_id: 's2',
@@ -133,10 +157,10 @@ describe('defers (no enforcement)', () => {
         ],
       },
     });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
   });
 
-  test('always-ask preference → defer', () => {
+  test('always-ask preference → pass-through', () => {
     writeProjectPref('test-q', 'always-ask');
     const r = runHook({
       session_id: 's3',
@@ -148,10 +172,10 @@ describe('defers (no enforcement)', () => {
         ],
       },
     });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
   });
 
-  test('empty stdin → defer (crash safety)', () => {
+  test('empty stdin → pass-through (crash safety)', () => {
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
       if (v !== undefined) env[k] = v;
@@ -159,14 +183,39 @@ describe('defers (no enforcement)', () => {
     env.GSTACK_STATE_ROOT = stateRoot;
     const res = spawnSync(HOOK, [], { env, input: '', encoding: 'utf-8' });
     expect(res.status).toBe(0);
-    const parsed = JSON.parse(res.stdout || '{}');
-    expect(parsed.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expect(res.stdout).toBe('');
   });
 
-  test('non-AUQ tool_name → defer (defensive)', () => {
+  test('non-AUQ tool_name → pass-through (defensive)', () => {
     writeProjectPref('test-q', 'never-ask');
     const r = runHook({ session_id: 's4', tool_name: 'Bash', tool_use_id: 'tu-4', tool_input: {} });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
+  });
+
+  // #2035 tripwire: no non-deny/non-allow path may EVER put the string
+  // "permissionDecision" on stdout. Emitting one on a pass-through path (any
+  // value — 'defer' included) hands the platform a decision where the hook
+  // has none, and 'defer' specifically pauses the call for a resumption that
+  // never comes in interactive sessions.
+  test('pass-through stdout never contains "permissionDecision" (#2035)', () => {
+    const paths = [
+      runHook({
+        session_id: 's-trip-1',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: 'tu-trip-1',
+        tool_input: {
+          questions: [
+            { question: '<gstack-qid:test-q> Approve?', options: ['A) Yes (recommended)', 'B) No'] },
+          ],
+        },
+      }),
+      runHook({ session_id: 's-trip-2', tool_name: 'Bash', tool_use_id: 'tu-trip-2', tool_input: {} }),
+      runHook({ session_id: 's-trip-3', tool_name: 'AskUserQuestion', tool_use_id: 'tu-trip-3', tool_input: { questions: [] } }),
+    ];
+    for (const r of paths) {
+      expect(r.status).toBe(0);
+      expect(r.stdout).not.toContain('"permissionDecision"');
+    }
   });
 });
 
@@ -196,7 +245,7 @@ describe('enforces never-ask preferences', () => {
     expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('Fix now');
   });
 
-  test('one-way door → defer even with never-ask (safety override)', () => {
+  test('one-way door → pass-through even with never-ask (safety override)', () => {
     writeProjectPref('ship-test-failure-triage', 'never-ask');
     const r = runHook({
       session_id: 's6',
@@ -211,10 +260,10 @@ describe('enforces never-ask preferences', () => {
         ],
       },
     });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
   });
 
-  test('ambiguous recommendation (two labels) → defer (D2 refuse-on-ambiguous)', () => {
+  test('ambiguous recommendation (two labels) → pass-through (D2 refuse-on-ambiguous)', () => {
     writeProjectPref('ship-pre-landing-review-fix', 'never-ask');
     const r = runHook({
       session_id: 's7',
@@ -229,10 +278,10 @@ describe('enforces never-ask preferences', () => {
         ],
       },
     });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
   });
 
-  test('no recommendation marker AND no prose match → defer', () => {
+  test('no recommendation marker AND no prose match → pass-through', () => {
     writeProjectPref('ship-pre-landing-review-fix', 'never-ask');
     const r = runHook({
       session_id: 's8',
@@ -247,7 +296,48 @@ describe('enforces never-ask preferences', () => {
         ],
       },
     });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
+  });
+
+  // #2024: unregistered ids used to default straight to two-way without ever
+  // consulting the keyword classifier — an ad-hoc DESTRUCTIVE question with a
+  // stored never-ask preference auto-decided. The hook now falls back to
+  // classifyQuestion on the question text when the registry lookup misses.
+  test('unregistered id + never-ask + destructive text → pass-through (keyword net fires, #2024)', () => {
+    writeProjectPref('adhoc-credential-cleanup', 'never-ask');
+    const r = runHook({
+      session_id: 's-kw-1',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-kw-1',
+      tool_input: {
+        questions: [
+          {
+            question: '<gstack-qid:adhoc-credential-cleanup> Reset my secret and proceed?',
+            options: ['A) Yes (recommended)', 'B) No'],
+          },
+        ],
+      },
+    });
+    expectPassThrough(r);
+  });
+
+  test('unregistered id + never-ask + benign text → still deny (auto-decide unchanged)', () => {
+    writeProjectPref('adhoc-credential-cleanup', 'never-ask');
+    const r = runHook({
+      session_id: 's-kw-2',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-kw-2',
+      tool_input: {
+        questions: [
+          {
+            question: '<gstack-qid:adhoc-credential-cleanup> Reorganize the TODOs file?',
+            options: ['A) Yes (recommended)', 'B) No'],
+          },
+        ],
+      },
+    });
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('plan-tune auto-decide');
   });
 });
 
@@ -293,7 +383,7 @@ describe('precedence: project wins over global (D8)', () => {
     expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
-  test('project always-ask + global never-ask → defer (project wins)', () => {
+  test('project always-ask + global never-ask → pass-through (project wins)', () => {
     writeProjectPref('ship-pre-landing-review-fix', 'always-ask');
     writeGlobalPref('ship-pre-landing-review-fix', 'never-ask');
     const r = runHook({
@@ -309,7 +399,7 @@ describe('precedence: project wins over global (D8)', () => {
         ],
       },
     });
-    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('defer');
+    expectPassThrough(r);
   });
 });
 
@@ -334,6 +424,108 @@ describe('MCP variant', () => {
       },
     });
     expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+});
+
+// ----------------------------------------------------------------------
+// Conductor: deny + prose redirect (transport avoidance, not preference)
+// ----------------------------------------------------------------------
+
+describe('Conductor prose redirect', () => {
+  const CONDUCTOR = { CONDUCTOR_PORT: '55070' };
+
+  test('two-way, no preference → deny with [conductor] prose directive', () => {
+    const r = runHook({
+      session_id: 'c1',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-c1',
+      tool_input: {
+        questions: [
+          { question: '<gstack-qid:test-q> Need approval?', options: ['A) Yes (recommended)', 'B) No'] },
+        ],
+      },
+    }, undefined, CONDUCTOR);
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('[conductor]');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toMatch(/do not call askuserquestion/i);
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toMatch(/reply with a letter/i);
+  });
+
+  test('UNMARKED question (modal path) → deny with prose directive', () => {
+    const r = runHook({
+      session_id: 'c2',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-c2',
+      tool_input: {
+        questions: [
+          { question: 'No marker — an ad-hoc question', options: ['A) Yes (recommended)', 'B) No'] },
+        ],
+      },
+    }, undefined, CONDUCTOR);
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('[conductor]');
+  });
+
+  test('one-way door → deny with prose directive (NOT defer — destructive must reach human via prose)', () => {
+    const r = runHook({
+      session_id: 'c3',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-c3',
+      tool_input: {
+        questions: [
+          {
+            question: '<gstack-qid:ship-test-failure-triage> Tests failed.',
+            options: ['A) Fix now (recommended)', 'B) Investigate', 'C) Ack and ship'],
+          },
+        ],
+      },
+    }, undefined, CONDUCTOR);
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('[conductor]');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toMatch(/typed confirmation/i);
+  });
+
+  test('CONDUCTOR_WORKSPACE_PATH alone also triggers the redirect', () => {
+    const r = runHook({
+      session_id: 'c4',
+      tool_name: 'mcp__conductor__AskUserQuestion',
+      tool_use_id: 'tu-c4',
+      tool_input: {
+        questions: [{ question: '<gstack-qid:test-q> Pick?', options: ['A) X (recommended)', 'B) Y'] }],
+      },
+    }, undefined, { CONDUCTOR_WORKSPACE_PATH: '/Users/x/conductor/ws' });
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('[conductor]');
+  });
+
+  test('PRECEDENCE: full never-ask auto-decide still wins over Conductor prose', () => {
+    writeProjectPref('ship-pre-landing-review-fix', 'never-ask');
+    const r = runHook({
+      session_id: 'c5',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-c5',
+      tool_input: {
+        questions: [
+          {
+            question: '<gstack-qid:ship-pre-landing-review-fix> Pre-landing review flagged issue.',
+            options: ['A) Fix now (recommended)', 'B) Skip'],
+          },
+        ],
+      },
+    }, undefined, CONDUCTOR);
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    // auto-decide reason, NOT the conductor prose reason
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('plan-tune auto-decide');
+    expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).not.toContain('[conductor]');
+  });
+
+  test('non-AUQ tool in Conductor → still pass-through (no redirect on unrelated tools)', () => {
+    const r = runHook(
+      { session_id: 'c6', tool_name: 'Bash', tool_use_id: 'tu-c6', tool_input: {} },
+      undefined,
+      CONDUCTOR,
+    );
+    expectPassThrough(r);
   });
 });
 

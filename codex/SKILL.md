@@ -49,6 +49,27 @@ echo "SKILL_PREFIX: $_SKILL_PREFIX"
 source <(~/.claude/skills/gstack/bin/gstack-repo-mode 2>/dev/null) || true
 REPO_MODE=${REPO_MODE:-unknown}
 echo "REPO_MODE: $REPO_MODE"
+_SESSION_KIND=$(~/.claude/skills/gstack/bin/gstack-session-kind 2>/dev/null || echo "interactive")
+case "$_SESSION_KIND" in spawned|headless|interactive) ;; *) _SESSION_KIND="interactive" ;; esac
+echo "SESSION_KIND: $_SESSION_KIND"
+# Conductor host: AskUserQuestion is unreliable here (native disabled, MCP
+# variant flaky), so skills render decisions as prose instead of calling the
+# tool. Gated on !headless so an eval/CI run INSIDE Conductor (GSTACK_HEADLESS)
+# still BLOCKs rather than rendering prose to nobody.
+if [ "$_SESSION_KIND" != "headless" ] && { [ -n "${CONDUCTOR_WORKSPACE_PATH:-}" ] || [ -n "${CONDUCTOR_PORT:-}" ]; }; then
+  echo "CONDUCTOR_SESSION: true"
+fi
+_ACTIVATED=$([ -f ~/.gstack/.activated ] && echo "yes" || echo "no")
+_FIRST_LOOP_SHOWN=$([ -f ~/.gstack/.first-loop-tip-shown ] && echo "yes" || echo "no")
+echo "ACTIVATED: $_ACTIVATED"
+echo "FIRST_LOOP_SHOWN: $_FIRST_LOOP_SHOWN"
+# First-run project detection: run the detector ONLY on the first-ever skill run
+# (ACTIVATED=no, interactive) so it stays off the hot path for every run after.
+_FIRST_TASK=""
+if [ "$_ACTIVATED" = "no" ] && [ "$_SESSION_KIND" != "headless" ]; then
+  _FIRST_TASK=$(~/.claude/skills/gstack/bin/gstack-first-task-detect 2>/dev/null || true)
+fi
+echo "FIRST_TASK: $_FIRST_TASK"
 _LAKE_SEEN=$([ -f ~/.gstack/.completeness-intro-seen ] && echo "yes" || echo "no")
 echo "LAKE_INTRO: $_LAKE_SEEN"
 _TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || true)
@@ -62,13 +83,15 @@ if [ "$_EXPLAIN_LEVEL" != "default" ] && [ "$_EXPLAIN_LEVEL" != "terse" ]; then 
 echo "EXPLAIN_LEVEL: $_EXPLAIN_LEVEL"
 _QUESTION_TUNING=$(~/.claude/skills/gstack/bin/gstack-config get question_tuning 2>/dev/null || echo "false")
 echo "QUESTION_TUNING: $_QUESTION_TUNING"
+_UPDATE_CHECK=$(~/.claude/skills/gstack/bin/gstack-config get update_check 2>/dev/null || echo "true")
+echo "UPDATE_CHECK: $_UPDATE_CHECK"
 mkdir -p ~/.gstack/analytics
 if [ "$_TEL" != "off" ]; then
 echo '{"skill":"codex","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(_repo=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr -cd 'a-zA-Z0-9._-'); echo "${_repo:-unknown}")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
 fi
 for _PF in $(find ~/.gstack/analytics -maxdepth 1 -name '.pending-*' 2>/dev/null); do
   if [ -f "$_PF" ]; then
-    if [ "$_TEL" != "off" ] && [ -x "~/.claude/skills/gstack/bin/gstack-telemetry-log" ]; then
+    if [ "$_TEL" != "off" ] && [ -x "$HOME/.claude/skills/gstack/bin/gstack-telemetry-log" ]; then
       ~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type skill_run --skill _pending_finalize --outcome unknown --session-id "$_SESSION_ID" 2>/dev/null || true
     fi
     rm -f "$_PF" 2>/dev/null || true
@@ -88,9 +111,11 @@ else
 fi
 ~/.claude/skills/gstack/bin/gstack-timeline-log '{"skill":"codex","event":"started","branch":"'"$_BRANCH"'","session":"'"$_SESSION_ID"'"}' 2>/dev/null &
 _HAS_ROUTING="no"
-if [ -f CLAUDE.md ] && grep -q "## Skill routing" CLAUDE.md 2>/dev/null; then
-  _HAS_ROUTING="yes"
-fi
+for _RF in CLAUDE.md AGENTS.md; do
+  if [ -f "$_RF" ] && grep -q "## Skill routing" "$_RF" 2>/dev/null; then
+    _HAS_ROUTING="yes"
+  fi
+done
 _ROUTING_DECLINED=$(~/.claude/skills/gstack/bin/gstack-config get routing_declined 2>/dev/null || echo "false")
 echo "HAS_ROUTING: $_HAS_ROUTING"
 echo "ROUTING_DECLINED: $_ROUTING_DECLINED"
@@ -128,11 +153,13 @@ In plan mode, allowed because they inform the plan: `$B`, `$D`, `codex exec`/`co
 
 ## Skill Invocation During Plan Mode
 
-If the user invokes a skill in plan mode, the skill takes precedence over generic plan mode behavior. **Treat the skill file as executable instructions, not reference.** Follow it step by step starting from Step 0; the first AskUserQuestion is the workflow entering plan mode, not a violation of it. AskUserQuestion (any variant — `mcp__*__AskUserQuestion` or native; see "AskUserQuestion Format → Tool resolution") satisfies plan mode's end-of-turn requirement. If no variant is callable, the skill is BLOCKED — stop and report `BLOCKED — AskUserQuestion unavailable` per the AskUserQuestion Format rule. At a STOP point, stop immediately. Do not continue the workflow or call ExitPlanMode there. Commands marked "PLAN MODE EXCEPTION — ALWAYS RUN" execute. Call ExitPlanMode only after the skill workflow completes, or if the user tells you to cancel the skill or leave plan mode.
+If the user invokes a skill in plan mode, the skill takes precedence over generic plan mode behavior. **Treat the skill file as executable instructions, not reference.** Follow it step by step starting from Step 0; any AskUserQuestion the skill fires is the workflow operating within plan mode, not a violation of it — and a skill whose instructions resolve a question themselves (e.g. a plan-mode auto-select) may legitimately not ask it. AskUserQuestion (any variant — `mcp__*__AskUserQuestion` or native; see "AskUserQuestion Format → Tool resolution") satisfies plan mode's end-of-turn requirement. If AskUserQuestion is unavailable or a call fails, follow the AskUserQuestion Format failure fallback: `headless` → BLOCKED; `interactive` → the prose fallback (also satisfies end-of-turn). At a STOP point, stop immediately. Do not continue the workflow or call ExitPlanMode there. Commands marked "PLAN MODE EXCEPTION — ALWAYS RUN" execute. Call ExitPlanMode only after the skill workflow completes, or if the user tells you to cancel the skill or leave plan mode.
 
 If `PROACTIVE` is `"false"`, do not auto-invoke or proactively suggest skills. If a skill seems useful, ask: "I think /skillname might help here — want me to run it?"
 
 If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay `~/.claude/skills/gstack/[skill-name]/SKILL.md`.
+
+If `UPDATE_CHECK` is `"false"`, skip the next two lines — the update-check binary emits nothing in that mode, so there is no `UPGRADE_AVAILABLE` / `JUST_UPGRADED` output to act on.
 
 If output shows `UPGRADE_AVAILABLE <old> <new>`: read `~/.claude/skills/gstack/gstack-upgrade/SKILL.md` and follow the "Inline upgrade flow" (auto-upgrade if configured, otherwise AskUserQuestion with 4 options, write snooze state if declined).
 
@@ -163,7 +190,7 @@ touch ~/.gstack/.writing-style-prompted
 
 Skip if `WRITING_STYLE_PENDING` is `no`.
 
-If `LAKE_INTRO` is `no`: say "gstack follows the **Boil the Lake** principle — do the complete thing when AI makes marginal cost near-zero. Read more: https://garryslist.org/posts/boil-the-ocean" Offer to open:
+If `LAKE_INTRO` is `no`: say "gstack follows the **Boil the Ocean** principle — do the complete thing when AI makes marginal cost near-zero. Read more: https://garryslist.org/posts/boil-the-ocean" Offer to open:
 
 ```bash
 open https://garryslist.org/posts/boil-the-ocean
@@ -217,6 +244,24 @@ touch ~/.gstack/.proactive-prompted
 ```
 
 Skip if `PROACTIVE_PROMPTED` is `yes`.
+
+## First-run guidance (one-time)
+
+If `ACTIVATED` is `no` (first skill run on this machine) AND the preamble printed a non-empty `FIRST_TASK:` value that is NOT `nongit`: show ONE short, project-specific line mapped from the token, as a heads-up, then CONTINUE with whatever the user actually asked — do NOT halt their task. Map the token: `greenfield` → "Fresh repo — shape it first with `/spec` or `/office-hours`." `code_node`/`code_python`/`code_rust`/`code_go`/`code_ruby`/`code_ios` → "There's code here — `/qa` to see it work, or `/investigate` if something's off." `branch_ahead` → "Unshipped work on this branch — `/review` then `/ship`." `dirty_default` → "Uncommitted changes — `/review` before committing." `clean_default` → "Pick one: `/spec`, `/investigate`, or `/qa`." Then substitute the token you saw for TASK_TOKEN and run (best-effort), and mark activated:
+```bash
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type first_task_scaffold_shown --skill "TASK_TOKEN" --outcome shown 2>/dev/null || true
+touch ~/.gstack/.activated 2>/dev/null || true
+```
+
+If `ACTIVATED` is `no` but `FIRST_TASK:` is empty or `nongit` (headless, non-git, or nothing actionable): show nothing, just run `touch ~/.gstack/.activated 2>/dev/null || true`.
+
+Else if `ACTIVATED` is `yes` AND `FIRST_LOOP_SHOWN` is `no`: say once as a heads-up (then continue):
+
+> Tip: gstack pays off when you complete one loop — **plan → review → ship**. A common first loop: `/office-hours` or `/spec` to shape it, `/plan-eng-review` to lock it, then `/ship`.
+
+Then run `touch ~/.gstack/.first-loop-tip-shown 2>/dev/null || true`.
+
+Skip this section if `ACTIVATED` and `FIRST_LOOP_SHOWN` are both `yes`.
 
 If `HAS_ROUTING` is `no` AND `ROUTING_DECLINED` is `false` AND `PROACTIVE_PROMPTED` is `yes`:
 Check if a CLAUDE.md file exists in the project root. If it does not exist, create it.
@@ -298,13 +343,39 @@ AI orchestrator (e.g., OpenClaw). In spawned sessions:
 
 "AskUserQuestion" can resolve to two tools at runtime: the **host MCP variant** (e.g. `mcp__conductor__AskUserQuestion` — appears in your tool list when the host registers it) or the **native** Claude Code tool.
 
-**Rule:** if any `mcp__*__AskUserQuestion` variant is in your tool list, prefer it. Hosts may disable native AUQ via `--disallowedTools AskUserQuestion` (Conductor does, by default) and route through their MCP variant; calling native there silently fails. Same questions/options shape; same decision-brief format applies.
+**Conductor rule (read before the MCP rule):** if `CONDUCTOR_SESSION: true` was echoed by the preamble, do NOT call AskUserQuestion at all — neither native nor any `mcp__*__AskUserQuestion` variant. Render EVERY decision brief as the **prose form** below and STOP. This is proactive, not a reaction to a failure: Conductor disables native AUQ and its MCP variant is flaky (it returns `[Tool result missing due to internal error]`), so prose is the reliable path. **Auto-decide preferences still apply first:** if a `[plan-tune auto-decide] <id> → <option>` result has already surfaced for a question, proceed with that option (no prose). Because in Conductor you go straight to prose without ever calling the tool, this auto-decide-first ordering is enforced HERE, not only by the PreToolUse hook. When you render a Conductor prose brief, also capture it with `bin/gstack-question-log` (the PostToolUse capture hook never fires on a prose path, so `/plan-tune` history/learning depends on this call).
 
-**If no AskUserQuestion variant appears in your tool list, this skill is BLOCKED.** Stop, report `BLOCKED — AskUserQuestion unavailable`, and wait for the user. Do not write decisions to the plan file as a substitute, do not emit them as prose and stop, and do not silently auto-decide (only `/plan-tune` AUTO_DECIDE opt-ins authorize auto-picking).
+**Rule (non-Conductor):** if any `mcp__*__AskUserQuestion` variant is in your tool list, prefer it. Hosts may disable native AUQ via `--disallowedTools AskUserQuestion` (Conductor does, by default) and route through their MCP variant; calling native there silently fails. Same questions/options shape; same decision-brief format applies.
+
+If AskUserQuestion is unavailable (no variant in your tool list) OR a call to it fails, do NOT silently auto-decide or write the decision to the plan file as a substitute. Follow the **failure fallback** below.
+
+### When AskUserQuestion is unavailable or a call fails
+
+Tell three outcomes apart:
+
+1. **Auto-decide denial (NOT a failure).** The result contains `[plan-tune auto-decide] <id> → <option>` — the preference hook working as designed. Proceed with that option. Do NOT retry, do NOT fall back to prose.
+2. **Genuine failure** — no variant in your tool list, OR the variant is present but the call returns an error / missing result (MCP transport error, empty result, host bug — e.g. Conductor's MCP AskUserQuestion is flaky and returns `[Tool result missing due to internal error]`).
+   - If it was present and **errored** (not absent), retry the SAME call **once** — but only if no answer could have surfaced (a missing-result error can arrive after the user already saw the question; retrying would double-prompt, so if it may have reached them, treat as pending, don't retry).
+   - Then branch on `SESSION_KIND` (echoed by the preamble; empty/absent ⇒ `interactive`):
+     - `spawned` → defer to the **Spawned session** block: auto-choose the recommended option. Never prose, never BLOCKED.
+     - `headless` → `BLOCKED — AskUserQuestion unavailable`; stop and wait (no human can answer).
+     - `interactive` → **prose fallback** (below).
+
+**Prose fallback — render the decision brief as a markdown message, not a tool call.** Same information as the tool format below, different structure (paragraphs, not ✅/❌ bullets). It MUST surface this triad:
+
+1. **A clear ELI10 of the issue itself** — plain English on what's being decided and why it matters (the question, not per-choice), naming the stakes. Lead with it.
+2. **Completeness scores per choice** — explicit `Completeness: X/10` on EACH choice (10 complete, 7 happy-path, 3 shortcut); use the kind-note when options differ in kind not coverage, but never silently drop the score.
+3. **The recommendation and why** — a `Recommendation: <choice> because <reason>` line plus the `(recommended)` marker on that choice.
+
+Layout: a `D<N>` title + a one-line note to reply with a letter (in Conductor this is the normal path; elsewhere it means AskUserQuestion was unavailable or errored); the issue ELI10; the Recommendation line; then ONE paragraph per choice carrying its `(recommended)` marker, its `Completeness: X/10`, and 2-4 sentences of reasoning — never a bare bullet list; a closing `Net:` line. Split chains / 5+ options: one prose block per per-option call, in sequence. Then STOP and wait — the user's typed answer is the decision. In plan mode this satisfies end-of-turn like a tool call.
+
+**Continuation — mapping a typed reply back to a brief.** Each brief carries a stable label (`D<N>`, or `D<N>.k` in a split chain). The user references it (e.g. "3.2: B"). A bare letter maps to the single most-recent UNANSWERED brief; if more than one is open (a split chain), do NOT guess — ask which `D<N>.k` it answers. Never apply a bare letter ambiguously across a chain.
+
+**One-way / destructive confirmations in prose.** When the decision is a one-way door (irreversible or destructive — delete, force-push, drop, overwrite), prose is a WEAKER gate than the tool, so make it stronger: require an explicit typed confirmation (the exact option letter or word), state plainly what is irreversible, and NEVER proceed on a vague, partial, or ambiguous reply — re-ask instead. Treat silence or "ok"/"sure" without the explicit choice as not-yet-confirmed.
 
 ### Format
 
-Every AskUserQuestion is a decision brief and must be sent as tool_use, not prose.
+Every AskUserQuestion is a decision brief and must be sent as tool_use, not prose — unless the documented failure fallback above applies (interactive session + the call is unavailable/erroring), in which case the prose fallback is the correct output.
 
 ```
 D<N> — <one-line question title>
@@ -366,25 +437,12 @@ so split chains are never AUTO_DECIDE-eligible — the user's option set is sacr
 **Full rule + worked examples + Hold/dependency semantics:** see
 `docs/askuserquestion-split.md` in the gstack repo. Read on demand when N>4.
 
-**Non-ASCII characters — write directly, never \u-escape.** When any
-    string field (question, option label, option description) contains
-    Chinese (繁體/簡體), Japanese, Korean, or other non-ASCII text, emit
-    the literal UTF-8 characters in the JSON string. **Never escape them
-    as `\uXXXX`.** Claude Code's tool parameter pipe is UTF-8 native
-    and passes characters through unchanged. Manually escaping requires
-    recalling each codepoint from training, which is unreliable for long
-    CJK strings — the model regularly emits the wrong codepoint (e.g.
-    writes `\u3103` thinking it is 管 U+7BA1, but `\u3103` is
-    actually ㄃, so the user sees `管理工具` rendered as `㄃3用箱`).
-    The trigger is long, multi-line questions with hundreds of CJK
-    characters: that is exactly when reflexive escaping kicks in and
-    exactly when miscoding is most damaging. Long ≠ escape. Keep
-    characters literal.
-
-    Wrong: `"question": "請選擇\uXXXX\uXXXX\uXXXX\uXXXX"`
-    Right: `"question": "請選擇管理工具"`
-
-    Only JSON-mandatory escapes remain allowed: `\n`, `\t`, `\"`, `\\`.
+**Non-ASCII characters — write directly, never \u-escape.** When any string
+field contains Chinese (繁體/簡體), Japanese, Korean, or other non-ASCII text,
+emit the literal UTF-8 characters; never escape them as `\uXXXX` (the pipe is
+UTF-8 native, and manual escaping miscodes long CJK strings). Only `\n`,
+`\t`, `\"`, `\\` remain allowed. Full rationale + worked example: see
+`docs/askuserquestion-cjk.md`. Read on demand when a question contains CJK.
 
 ### Self-check before emitting
 
@@ -397,7 +455,7 @@ Before calling AskUserQuestion, verify:
 - [ ] (recommended) label on one option (even for neutral-posture)
 - [ ] Dual-scale effort labels on effort-bearing options (human / CC)
 - [ ] Net line closes the decision
-- [ ] You are calling the tool, not writing prose
+- [ ] You are calling the tool, not writing prose — unless `CONDUCTOR_SESSION: true` (then prose is the DEFAULT, not the tool) OR the documented failure fallback applies (then: prose with the mandatory triad — issue ELI10, per-choice Completeness, Recommendation + `(recommended)` — and a "reply with a letter" instruction, then STOP)
 - [ ] Non-ASCII characters (CJK / accents) written directly, NOT \u-escaped
 - [ ] If you had 5+ options, you split (or batched into ≤4-groups) — did NOT drop any
 - [ ] If you split, you checked dependencies between options before firing the chain
@@ -415,8 +473,8 @@ if [ -f "$HOME/.gstack-artifacts-remote.txt" ]; then
 else
   _BRAIN_REMOTE_FILE="$HOME/.gstack-brain-remote.txt"
 fi
-_BRAIN_SYNC_BIN="~/.claude/skills/gstack/bin/gstack-brain-sync"
-_BRAIN_CONFIG_BIN="~/.claude/skills/gstack/bin/gstack-config"
+_BRAIN_SYNC_BIN="$HOME/.claude/skills/gstack/bin/gstack-brain-sync"
+_BRAIN_CONFIG_BIN="$HOME/.claude/skills/gstack/bin/gstack-config"
 
 # /sync-gbrain context-load: teach the agent to use gbrain when it's available.
 # Per-worktree pin: post-spike redesign uses kubectl-style `.gbrain-source` in the
@@ -451,10 +509,13 @@ _BRAIN_SYNC_MODE=$("$_BRAIN_CONFIG_BIN" get artifacts_sync_mode 2>/dev/null || e
 # Detect remote-MCP mode (Path 4 of /setup-gbrain). Local artifacts sync is
 # a no-op in remote mode; the brain server pulls from GitHub/GitLab on its
 # own cadence. Read claude.json directly to keep this preamble fast (no
-# subprocess to claude CLI on every skill start).
+# subprocess to claude CLI on every skill start). Both registration scopes
+# are read (#2499): user scope, then the nearest-ancestor project scope.
 _GBRAIN_MCP_MODE="none"
+_GBRAIN_MCP_ENTRY=""
 if command -v jq >/dev/null 2>&1 && [ -f "$HOME/.claude.json" ]; then
-  _GBRAIN_MCP_TYPE=$(jq -r '.mcpServers.gbrain.type // .mcpServers.gbrain.transport // empty' "$HOME/.claude.json" 2>/dev/null)
+  _GBRAIN_MCP_ENTRY=$(jq -c --arg cwd "$PWD" '((.projects // {}) | to_entries | map(select((.key as $k | $cwd == $k or ($cwd | startswith($k + "/")) or ($cwd | startswith($k + "\\"))) and ((try .value.mcpServers.gbrain catch null) != null))) | sort_by(.key | length) | last | .value.mcpServers.gbrain) // .mcpServers.gbrain // empty' "$HOME/.claude.json" 2>/dev/null)
+  _GBRAIN_MCP_TYPE=$(printf '%s' "$_GBRAIN_MCP_ENTRY" | jq -r '.type // .transport // empty' 2>/dev/null)
   case "$_GBRAIN_MCP_TYPE" in
     url|http|sse) _GBRAIN_MCP_MODE="remote-http" ;;
     stdio) _GBRAIN_MCP_MODE="local-stdio" ;;
@@ -475,6 +536,7 @@ if [ -d "$_GSTACK_HOME/.git" ] && [ "$_BRAIN_SYNC_MODE" != "off" ]; then
   _BRAIN_DO_PULL=1
   if [ -f "$_BRAIN_LAST_PULL_FILE" ]; then
     _BRAIN_LAST=$(cat "$_BRAIN_LAST_PULL_FILE" 2>/dev/null || echo 0)
+    case "$_BRAIN_LAST" in ''|*[!0-9]*) _BRAIN_LAST=0 ;; esac
     _BRAIN_AGE=$(( _BRAIN_NOW - _BRAIN_LAST ))
     [ "$_BRAIN_AGE" -lt 86400 ] && _BRAIN_DO_PULL=0
   fi
@@ -488,11 +550,15 @@ fi
 if [ "$_GBRAIN_MCP_MODE" = "remote-http" ]; then
   # Remote-MCP mode: local artifacts sync is a no-op (brain admin's server
   # pulls from GitHub/GitLab). Show the user this is by design, not broken.
-  _GBRAIN_HOST=$(jq -r '.mcpServers.gbrain.url // empty' "$HOME/.claude.json" 2>/dev/null | sed -E 's|^https?://([^/:]+).*|\1|')
+  _GBRAIN_HOST=$(printf '%s' "${_GBRAIN_MCP_ENTRY:-}" | jq -r '.url // empty' 2>/dev/null | sed -E 's|^https?://([^/:]+).*|\1|' | head -1 | tr -cd 'A-Za-z0-9._-')
   echo "ARTIFACTS_SYNC: remote-mode (managed by brain server ${_GBRAIN_HOST:-remote})"
 elif [ -d "$_GSTACK_HOME/.git" ] && [ "$_BRAIN_SYNC_MODE" != "off" ]; then
   _BRAIN_QUEUE_DEPTH=0
-  [ -f "$_GSTACK_HOME/.brain-queue.jsonl" ] && _BRAIN_QUEUE_DEPTH=$(wc -l < "$_GSTACK_HOME/.brain-queue.jsonl" | tr -d ' ')
+  # Spool-dir queue (one file per record); legacy .brain-queue.jsonl lines are
+  # counted too until the drain migrates them.
+  [ -d "$_GSTACK_HOME/.brain-queue.d" ] && _BRAIN_QUEUE_DEPTH=$(find "$_GSTACK_HOME/.brain-queue.d" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  [ -f "$_GSTACK_HOME/.brain-queue.jsonl" ] && _BRAIN_QUEUE_DEPTH=$(( _BRAIN_QUEUE_DEPTH + $(wc -l < "$_GSTACK_HOME/.brain-queue.jsonl" | tr -d ' ') ))
+  [ -f "$_GSTACK_HOME/.brain-queue.jsonl.migrating" ] && _BRAIN_QUEUE_DEPTH=$(( _BRAIN_QUEUE_DEPTH + $(wc -l < "$_GSTACK_HOME/.brain-queue.jsonl.migrating" | tr -d ' ') ))
   _BRAIN_LAST_PUSH="never"
   [ -f "$_GSTACK_HOME/.brain-last-push" ] && _BRAIN_LAST_PUSH=$(cat "$_GSTACK_HOME/.brain-last-push" 2>/dev/null || echo never)
   echo "ARTIFACTS_SYNC: mode=$_BRAIN_SYNC_MODE | last_push=$_BRAIN_LAST_PUSH | queue=$_BRAIN_QUEUE_DEPTH"
@@ -525,8 +591,8 @@ If A/B and `~/.gstack/.git` is missing, ask whether to run `gstack-artifacts-ini
 At skill END before telemetry:
 
 ```bash
-"~/.claude/skills/gstack/bin/gstack-brain-sync" --discover-new 2>/dev/null || true
-"~/.claude/skills/gstack/bin/gstack-brain-sync" --once 2>/dev/null || true
+"$HOME/.claude/skills/gstack/bin/gstack-brain-sync" --discover-new 2>/dev/null || true
+"$HOME/.claude/skills/gstack/bin/gstack-brain-sync" --once 2>/dev/null || true
 ```
 
 
@@ -573,8 +639,8 @@ eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
 _PROJ="${GSTACK_HOME:-$HOME/.gstack}/projects/${SLUG:-unknown}"
 if [ -d "$_PROJ" ]; then
   echo "--- RECENT ARTIFACTS ---"
-  find "$_PROJ/ceo-plans" "$_PROJ/checkpoints" -type f -name "*.md" 2>/dev/null | xargs ls -t 2>/dev/null | head -3
-  [ -f "$_PROJ/${_BRANCH}-reviews.jsonl" ] && echo "REVIEWS: $(wc -l < "$_PROJ/${_BRANCH}-reviews.jsonl" | tr -d ' ') entries"
+  find "$_PROJ/ceo-plans" "$_PROJ/checkpoints" -type f -name "*.md" 2>/dev/null | xargs -r ls -t 2>/dev/null | head -3
+  [ -f "$_PROJ/${BRANCH:-unknown}-reviews.jsonl" ] && echo "REVIEWS: $(wc -l < "$_PROJ/${BRANCH:-unknown}-reviews.jsonl" | tr -d ' ') entries"
   [ -f "$_PROJ/timeline.jsonl" ] && tail -5 "$_PROJ/timeline.jsonl"
   if [ -f "$_PROJ/timeline.jsonl" ]; then
     _LAST=$(grep "\"branch\":\"${_BRANCH}\"" "$_PROJ/timeline.jsonl" 2>/dev/null | grep '"event":"completed"' | tail -1)
@@ -582,13 +648,20 @@ if [ -d "$_PROJ" ]; then
     _RECENT_SKILLS=$(grep "\"branch\":\"${_BRANCH}\"" "$_PROJ/timeline.jsonl" 2>/dev/null | grep '"event":"completed"' | tail -3 | grep -o '"skill":"[^"]*"' | sed 's/"skill":"//;s/"//' | tr '\n' ',')
     [ -n "$_RECENT_SKILLS" ] && echo "RECENT_PATTERN: $_RECENT_SKILLS"
   fi
-  _LATEST_CP=$(find "$_PROJ/checkpoints" -name "*.md" -type f 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
+  _LATEST_CP=$(find "$_PROJ/checkpoints" -name "*.md" -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | head -1)
   [ -n "$_LATEST_CP" ] && echo "LATEST_CHECKPOINT: $_LATEST_CP"
+  if [ -f "$_PROJ/decisions.active.json" ]; then
+    echo "--- ACTIVE DECISIONS (recent, scope-relevant) ---"
+    ~/.claude/skills/gstack/bin/gstack-decision-search --recent 5 2>/dev/null
+    echo "--- END DECISIONS ---"
+  fi
   echo "--- END ARTIFACTS ---"
 fi
 ```
 
 If artifacts are listed, read the newest useful one. If `LAST_SESSION` or `LATEST_CHECKPOINT` appears, give a 2-sentence welcome back summary. If `RECENT_PATTERN` clearly implies a next skill, suggest it once.
+
+**Cross-session decisions.** If `ACTIVE DECISIONS` are listed, treat them as prior settled calls with their rationale — do not silently re-litigate them; if you're about to reverse one, say so explicitly. Reach for `~/.claude/skills/gstack/bin/gstack-decision-search` whenever a question touches a past decision ("what did we decide / why / did we try"). When you or the user make a DURABLE decision (architecture, scope, tool/vendor choice, or a reversal) — NOT a turn-level or trivial choice — log it with `~/.claude/skills/gstack/bin/gstack-decision-log` (`--supersede <id>` for a reversal). Reliable and local; gbrain not required.
 
 ## Writing Style (skip entirely if `EXPLAIN_LEVEL: terse` appears in the preamble echo OR the user's current message explicitly requests terse / no-explanations output)
 
@@ -604,15 +677,19 @@ Applies to AskUserQuestion, user replies, and findings. AskUserQuestion Format i
 Curated jargon list lives at `~/.claude/skills/gstack/scripts/jargon-list.json` (80+ terms). On the first jargon term you encounter this session, Read that file once; treat the `terms` array as the canonical list. The list is repo-owned and may grow between releases.
 
 
-## Completeness Principle — Boil the Lake
+## Completeness Principle — Boil the Ocean
 
-AI makes completeness cheap. Recommend complete lakes (tests, edge cases, error paths); flag oceans (rewrites, multi-quarter migrations).
+AI makes completeness cheap, so the complete thing is the goal. Recommend full coverage (tests, edge cases, error paths) — boil the ocean one lake at a time. The only thing out of scope is genuinely unrelated work (rewrites, multi-quarter migrations); flag that as separate scope, never as an excuse for a shortcut.
 
 When options differ in coverage, include `Completeness: X/10` (10 = all edge cases, 7 = happy path, 3 = shortcut). When options differ in kind, write: `Note: options differ in kind, not coverage — no completeness score.` Do not fabricate scores.
 
 ## Confusion Protocol
 
 For high-stakes ambiguity (architecture, data model, destructive scope, missing context), STOP. Name it in one sentence, present 2-3 options with tradeoffs, and ask. Do not use for routine coding or obvious changes.
+
+## Claimed Limitations Need Evidence
+
+A claimed limitation or requirement ("the API can't do this", "X requires a credential", "that's impossible on this platform") is a material claim. State one only with the verbatim error, the documented statement, or a live probe in hand — pattern-matching a failure to a familiar story is not evidence. When a cheap probe settles the question, run it BEFORE asking the user anything or declaring a step blocked.
 
 ## Continuous Checkpoint Mode
 
@@ -647,7 +724,7 @@ If you are looping on the same diagnostic, same file, or failed fix variants, ST
 
 ## Question Tuning (skip entirely if `QUESTION_TUNING: false`)
 
-Before each AskUserQuestion, choose `question_id` from `scripts/question-registry.ts` or `{skill}-{slug}`, then run `~/.claude/skills/gstack/bin/gstack-question-preference --check "<id>"`. `AUTO_DECIDE` means choose the recommended option and say "Auto-decided [summary] → [option] (your preference). Change with /plan-tune." `ASK_NORMALLY` means ask.
+Before each AskUserQuestion, choose `question_id` from `~/.claude/skills/gstack/scripts/question-registry.ts` or `{skill}-{slug}`, then run `printf '%s' "<question summary>" | ~/.claude/skills/gstack/bin/gstack-question-preference --check "<id>" --summary-stdin` (piped summary feeds the one-way keyword net, #2024). `AUTO_DECIDE` means choose the recommended option and say "Auto-decided [summary] → [option] (your preference). Change with /plan-tune." `ASK_NORMALLY` means ask.
 
 **Embed the question_id as a marker in the question text** so hooks can identify it deterministically (plan-tune cathedral T14 / D18 progressive markers). Append `<gstack-qid:{question_id}>` somewhere in the rendered question (the leading line or trailing line is fine; the marker doesn't render visibly to the user when wrapped in HTML-style angle brackets, but the hook strips it). Without the marker the PreToolUse enforcement hook treats the AUQ as observed-only and never auto-decides — so always include it when the question matches a registered `question_id`.
 
@@ -699,7 +776,13 @@ Escalate after 3 failed attempts, uncertain security-sensitive changes, or scope
 
 ## Operational Self-Improvement
 
-Before completing, if you discovered a durable project quirk or command fix that would save 5+ minutes next time, log it:
+Before completing, review the session for durable learnings and log each one —
+this step ALWAYS runs, it is not conditional on something feeling noteworthy
+(#2402: 43 of 44 learnings came from explicit /learn because "if you
+discovered" read as optional). A durable learning is a project quirk, command
+fix, pitfall, or pattern that would save 5+ minutes in a future session. If
+the review genuinely surfaces none, state "No durable learnings this session"
+in your completion summary — an explicit empty result, not a skipped step.
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-learnings-log '{"skill":"SKILL_NAME","type":"operational","key":"SHORT_KEY","insight":"DESCRIPTION","confidence":N,"source":"observed"}'
@@ -730,11 +813,15 @@ fi
 if [ "$_TEL" != "off" ] && [ -x ~/.claude/skills/gstack/bin/gstack-telemetry-log ]; then
   ~/.claude/skills/gstack/bin/gstack-telemetry-log \
     --skill "SKILL_NAME" --duration "$_TEL_DUR" --outcome "OUTCOME" \
-    --used-browse "USED_BROWSE" --session-id "$_SESSION_ID" 2>/dev/null &
+    --used-browse "USED_BROWSE" --session-id "$_SESSION_ID" \
+    --error-message "ERROR_MESSAGE" --failed-step "FAILED_STEP" 2>/dev/null &
 fi
 ```
 
 Replace `SKILL_NAME`, `OUTCOME`, and `USED_BROWSE` before running.
+Replace `ERROR_MESSAGE` with a short description of the error (if outcome is error,
+otherwise use empty string ""), and `FAILED_STEP` with the step name or number where
+the failure occurred (if outcome is error, otherwise use empty string "").
 
 ## Plan Status Footer
 
@@ -807,25 +894,49 @@ source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null && _gstack_cod
 
 ---
 
-## Step 0.5: Auth probe + version check
+## Step 0.5: Auth probe + model probe + version check
 
-Before building expensive prompts, verify Codex has valid auth AND the installed
-CLI version isn't in the known-bad list. Sourcing `gstack-codex-probe` loads the
-shared helpers that both `/codex` and `/autoplan` use.
+Before building expensive prompts, verify Codex has valid auth, that the account
+can actually USE its configured model, AND the installed CLI version isn't in the
+known-bad list. Sourcing `gstack-codex-probe` loads the shared helpers that both
+`/codex` and `/autoplan` use.
 
 ```bash
 _TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
 source ~/.claude/skills/gstack/bin/gstack-codex-probe
 
-if ! _gstack_codex_auth_probe >/dev/null; then
+# Running-under-Codex presence probe (#2519): a live Codex session exports
+# CODEX_THREAD_ID / CODEX_SANDBOX into every shell it spawns.
+if [ "${GSTACK_FORCE_CODEX_REVIEW:-0}" != "1" ] && { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ]; }; then
+  echo "UNDER_CODEX"
+elif ! _gstack_codex_auth_probe >/dev/null; then
   _gstack_codex_log_event "codex_auth_failed"
   echo "AUTH_FAILED"
+else
+  _gstack_codex_model_probe   # ~10s round trip on first run, cached 1h (#2477)
 fi
 _gstack_codex_version_check   # warns if known-bad, non-blocking
 ```
 
+If the output contains `UNDER_CODEX`, stop with exactly one line:
+"[running under Codex — /codex would nest the same model at multiplied token
+cost; skipped. Set `GSTACK_FORCE_CODEX_REVIEW=1` to force.]" The whole value
+of this skill is a SECOND model's opinion; inside a Codex host it is the same
+model reviewing itself, and nested spawns have burned 15M tokens in one
+/review (#2519).
+
 If the output contains `AUTH_FAILED`, stop and tell the user:
 "No Codex authentication found. Run `codex login` or set `$CODEX_API_KEY` / `$OPENAI_API_KEY`, then re-run this skill."
+
+If the output contains `MODEL_UNUSABLE`, stop — auth exists but the account
+cannot use the configured model (a stale `model =` pin in
+`~/.codex/config.toml` is the usual cause). Relay the probe's HINT lines and
+follow the "Model not supported (HTTP 400)" recovery steps in
+`## Error Handling` below. Running the modes anyway just burns four
+invocations on the same 400 (#2477).
+
+`MODEL_PROBE_INCONCLUSIVE` is non-blocking (timeout/transient network): pass
+the warning through and continue.
 
 If the version check printed a `WARN:` line, pass it through to the user verbatim
 (non-blocking — Codex may still work, but the user should upgrade).
@@ -893,12 +1004,18 @@ per-mode default below. Otherwise, use the per-mode defaults:
 
 ## Filesystem Boundary
 
-All prompts sent to Codex MUST be prefixed with this boundary instruction:
+Every prompt sent to Codex MUST be prefixed with this boundary instruction:
 
 > IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.
 
-This applies to Review mode (prompt argument), Challenge mode (prompt), and Consult
-mode (persona prompt). Reference this section as "the filesystem boundary" below.
+This applies to Challenge mode (prompt) and Consult mode (persona prompt), and to the
+custom-instructions path of Review mode — all three use `codex exec`, which still takes
+a free-form prompt argument. It does **not** apply to the default scoped `codex review`
+call in Step 2A: that command is invoked with **no prompt argument at all** (see "Scope
+flags exclude the prompt argument" below), so there is nowhere to put the preamble. That
+is acceptable — `codex review --base` hands the model a pre-computed diff rather than
+turning it loose on the filesystem, so the rabbit-hole risk the boundary guards against
+is much lower on that path. Reference this section as "the filesystem boundary" below.
 
 ---
 
@@ -906,28 +1023,48 @@ mode (persona prompt). Reference this section as "the filesystem boundary" below
 
 Run Codex code review against the current branch diff.
 
-1. Create temp files for output capture:
-```bash
-TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX.txt")
+**Scope flags exclude the prompt argument.** In `codex review [OPTIONS] [PROMPT]`, the
+`[PROMPT]` positional is mutually exclusive with every scope flag — `--base`, `--commit`,
+and `--uncommitted`. Passing both fails at argument parsing, before any API call:
+
+```
+error: the argument '[PROMPT]' cannot be used with '--base <BRANCH>'
 ```
 
-2. Run the review (5-minute timeout). **Codex CLI ≥ 0.130.0 rejects passing a
-custom prompt and `--base <branch>` together** (the two arguments are mutually
-exclusive at argv level), so put the base diff scope in the prompt instead of
-passing `--base`. Two paths:
+**Do not work around this by dropping the scope flag and keeping the prompt.** A
+prompt-only `codex review "<text>"` parses fine, but it silently falls back to the
+**uncommitted working-tree** scope — verified on 0.144.1, where it runs
+`git status --short; git diff` and reviews that. Telling the model in prompt text to
+"run git diff <base>...HEAD" does not change what the CLI feeds the reviewer, so you get
+a confidently-worded review of the wrong changes. The scope flag is the only thing that
+sets the scope. Pass it, and pass no prompt.
 
-**Default path (no custom user instructions):** call `codex review` with the
-filesystem boundary and explicit diff-scope instructions in the prompt. This
-preserves the boundary while avoiding the prompt-plus-`--base` argv shape:
+This is unconditional — no `codex --version` branch. `[PROMPT]` has always been optional,
+so the no-prompt form is valid on every version that supports `--base`. Custom
+instructions get their own path (below).
+
+1. Create temp files for output capture:
+```bash
+TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX")
+```
+
+2. Run the review. No prompt argument — scope comes from `--base` (or `--commit <sha>`
+when reviewing a single commit, or `--uncommitted` for the working tree).
+
+**Sandbox is pinned read-only via config override.** Top-level `codex review` has no
+`-s`/`--sandbox` flag (verified on 0.147.0: `codex review --help` lists none), so the
+read-only sandbox is set with `-c 'sandbox_mode="read-only"'` — the same form the
+consult resume path uses. Without it the call inherits the user's
+`~/.codex/config.toml` default, which on a trusted project can be WRITE access —
+contradicting this skill's read-only contract (#2496, #2524):
 
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
 cd "$_REPO_ROOT"
-# 330s (5.5min) is slightly longer than the Bash 300s so the shell wrapper
-# only fires if Bash's own timeout doesn't.
-_gstack_codex_timeout_wrapper 330 codex review "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
-
-Review the changes on this branch against the base branch <base>. Run git diff origin/<base>...HEAD 2>/dev/null || git diff <base>...HEAD to see the diff and review only those changes." -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null 2>"$TMPERR"
+# The 330s wrapper sits BELOW the 360s Bash gate so the wrapper fires FIRST
+# and a stall surfaces as a diagnosable exit 124 with an explicit message,
+# never as a silent harness kill that downstream reads as "no findings".
+_gstack_codex_timeout_wrapper 330 codex review --base <base> -c 'sandbox_mode="read-only"' -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null 2>"$TMPERR"
 _CODEX_EXIT=$?
 if [ "$_CODEX_EXIT" = "124" ]; then
   _gstack_codex_log_event "codex_timeout" "330"
@@ -945,18 +1082,21 @@ fi
 
 If the user passed `--xhigh`, use `"xhigh"` instead of `"high"`.
 
-**Custom-instructions path (user typed `/codex review <focus>`):** `codex exec`
-with the diff written to a tempfile and inlined into the prompt. We preserve
-the filesystem boundary here because `codex exec` is not auto-scoped to a diff
-the way `codex review` is. The DIFF_START/DIFF_END delimiters tell the model
-where data ends and instructions resume — a defense against prompt injection
-when the diff content is adversarial:
+**Custom-instructions path (user typed `/codex review <focus>`):** custom instructions
+cannot ride along with `--base` — that is exactly the combination the CLI rejects — and
+they cannot be smuggled in by dropping `--base`, because that silently switches the scope
+to the working tree. So they get their own command: `codex exec`, which still accepts a
+free-form prompt, with the diff written to a tempfile and inlined into it. We preserve
+the filesystem boundary here because `codex exec` is not auto-scoped to a diff the way
+`codex review` is. The DIFF_START/DIFF_END delimiters tell the model where data ends and
+instructions resume — a defense against prompt injection when the diff content is
+adversarial:
 
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
 cd "$_REPO_ROOT"
 _USER_INSTRUCTIONS="<everything after '/codex review ' in user input>"
-_PROMPT_FILE=$(mktemp "$TMP_ROOT/codex-prompt-XXXXXX.txt")
+_PROMPT_FILE=$(mktemp "$TMP_ROOT/codex-prompt-XXXXXX")
 {
   printf '%s\n' "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only."
   printf '\nCustom focus: %s\n\n' "$_USER_INSTRUCTIONS"
@@ -965,7 +1105,7 @@ _PROMPT_FILE=$(mktemp "$TMP_ROOT/codex-prompt-XXXXXX.txt")
   git diff "<base>...HEAD" 2>/dev/null
   printf '\nDIFF_END\n'
 } > "$_PROMPT_FILE"
-_gstack_codex_timeout_wrapper 330 codex exec -s read-only "$(cat "$_PROMPT_FILE")" -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null 2>"$TMPERR"
+_gstack_codex_timeout_wrapper 330 codex exec -s read-only "$(cat "$_PROMPT_FILE")" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null 2>"$TMPERR"
 _CODEX_EXIT=$?
 rm -f "$_PROMPT_FILE"
 if [ "$_CODEX_EXIT" = "124" ]; then
@@ -975,21 +1115,50 @@ if [ "$_CODEX_EXIT" = "124" ]; then
 fi
 ```
 
-**Why the dual path:** The default `codex review` path keeps Codex's review
-prompt tuning while scoping the diff in prompt text. The `codex exec` route loses
-that tuning but gains custom-instructions support; the prompt explicitly demands
-`[P1]` / `[P2]` markers so the gate logic in step 4 still works.
+When you take this path, say so in the output header — `CODEX SAYS (code review — custom
+instructions via codex exec):` — and note that the CLI does not accept custom instructions
+alongside `--base`, so the scope was expressed in the prompt instead.
 
-Use `timeout: 300000` on the Bash call for either path.
+**Why the dual path:** The default `codex review --base` path keeps Codex's own review
+prompt tuning and its authoritative diff scoping, at the cost of accepting no custom
+instructions. The `codex exec` route loses that tuning but gains custom-instructions
+support; the prompt explicitly demands `[P1]` / `[P2]` markers so the gate logic in step 4
+still works. There is no third option that gets both — the CLI forbids it.
+
+Use `timeout: 360000` on the Bash call for either path. The Bash gate sits ABOVE the
+330s wrapper deliberately: the wrapper fires first with its explicit exit-124 message,
+instead of the harness killing the call silently.
 
 3. Capture the output. Then parse cost from stderr:
 ```bash
 grep "tokens used" "$TMPERR" 2>/dev/null || echo "tokens: unknown"
 ```
 
-4. Determine gate verdict by checking the review output for critical findings.
-   If the output contains `[P1]` — the gate is **FAIL**.
-   If no `[P1]` markers are found (only `[P2]` or no findings) — the gate is **PASS**.
+4. Determine the gate verdict. **The gate FAILS CLOSED** — a run that cannot be
+verified is a FAIL, never a PASS. Work through these checks IN ORDER; the first
+match wins:
+
+   1. `_CODEX_EXIT` is non-zero (including 124) → **GATE: FAIL** (fail-closed:
+      codex exited `$_CODEX_EXIT` — the review did not complete, so there is no
+      verified result). Expired auth, a bad flag, a timeout, or a model-entitlement
+      400 all land here instead of masquerading as a clean pass.
+   2. The captured review output is empty or whitespace-only → **GATE: FAIL**
+      (fail-closed: empty output — nothing was reviewed).
+   3. The output contains `[P0]` or `[P1]` (or codex's native unbracketed `P0:` /
+      `P1:` severity labels) → **GATE: FAIL** (N critical findings). Codex's own
+      review rubric treats P0 as blocking; this gate does too.
+   4. The output contains NO `[P0]`, `[P1]`, or `[P2]` tag (nor native `P0:`/`P1:`/
+      `P2:` labels) anywhere → **GATE: FAIL** (fail-closed: untagged output — the
+      severity markers this gate greps for are absent, so "no critical findings"
+      cannot be verified mechanically; a human must read the verbatim output above
+      and judge). "No `[P1]` substring" and "no critical findings" are different
+      claims — never infer PASS from an untagged body.
+   5. Severity tags are present and none is P0/P1 (only P2/advisory) →
+      **GATE: PASS**.
+
+   There is no default branch: PASS is only reachable through check 5. When the
+   gate fails closed (checks 1, 2, 4), say explicitly that this is a
+   verification failure requiring human attention, not a finding count.
 
 5. Present the output:
 
@@ -1005,6 +1174,12 @@ or
 
 ```
 GATE: FAIL (N critical findings)
+```
+
+or, when the run itself could not be verified:
+
+```
+GATE: FAIL (fail-closed: <codex exited N | empty output | untagged output> — needs human attention)
 ```
 
 5a. **Synthesis recommendation (REQUIRED).** After presenting Codex's verbatim
@@ -1039,7 +1214,8 @@ CROSS-MODEL ANALYSIS:
 ```
 
 Substitute: TIMESTAMP (ISO 8601), STATUS ("clean" if PASS, "issues_found" if FAIL),
-GATE ("pass" or "fail"), findings (count of [P1] + [P2] markers),
+GATE ("pass" or "fail" — fail-closed verdicts log as "fail"), findings (count of
+[P0] + [P1] + [P2] markers; 0 for fail-closed runs, which reviewed nothing),
 findings_fixed (count of findings that were addressed/fixed before shipping).
 
 8. Clean up temp files:
@@ -1095,13 +1271,23 @@ Produce this markdown table:
 | DX Review | \`/plan-devex-review\` | Developer experience gaps | {runs} | {status} | {findings} |
 \`\`\`
 
-Below the table, add these lines (omit any that are empty/not applicable):
+Below the table, add these lines. **CODEX** and **CROSS-MODEL** are optional (omit when
+empty); **VERDICT** is always present:
 
 - **CODEX:** (only if codex-review ran) — one-line summary of codex fixes
 - **CROSS-MODEL:** (only if both Claude and Codex reviews exist) — overlap analysis
-- **UNRESOLVED:** total unresolved decisions across all reviews
 - **VERDICT:** list reviews that are CLEAR (e.g., "CEO + ENG CLEARED — ready to implement").
   If Eng Review is not CLEAR and not skipped globally, append "eng review required".
+
+**Unresolved-decisions status (MANDATORY — never omitted; the report's final non-whitespace
+line).** After VERDICT, end the report (content under the \`## GSTACK REVIEW REPORT\`
+heading — a bold label, never a new \`## \` heading; exempt from the "omit when empty"
+rule) with exactly one: the exact unbolded line \`NO UNRESOLVED DECISIONS\` (a bolded one
+does NOT count), OR a \`**UNRESOLVED DECISIONS:**\` header + one bullet per open item
+(last bullet = final line; add \`+ N unresolved from prior reviews\` only when N > 0).
+This avoids double-counting: list THIS review's open items from context; for prior reviews
+sum \`unresolved\` over the latest fresh row per skill (dashboard 7-day window) after you
+DROP the current skill's row; emit the sentinel only when both are zero.
 
 ### Write to the plan file
 
@@ -1143,12 +1329,17 @@ missing work — do NOT call ExitPlanMode:
    In-body prose that mentions "outside voice", "codex findings", or similar
    does NOT count — only the structured `## GSTACK REVIEW REPORT` section
    satisfies this check.
-3. Confirm the report contains: a Runs / Status / Findings table, a VERDICT
-   line, and absorbs CODEX / CROSS-MODEL / UNRESOLVED lines if applicable.
-4. If a plan file is in context for this skill invocation: confirm
+3. Confirm the report has a Runs / Status / Findings table and a VERDICT line
+   (CODEX / CROSS-MODEL absorbed if applicable).
+4. Confirm the report's FINAL non-whitespace line is the unresolved-decisions
+   status: the exact unbolded `NO UNRESOLVED DECISIONS`, or a bullet of a final
+   `**UNRESOLVED DECISIONS:**` block. BLOCKING, no "if applicable" escape — a
+   bolded sentinel, any trailing CODEX/CROSS-MODEL/VERDICT/prose, or a missing
+   status each FAILS the gate.
+5. If a plan file is in context for this skill invocation: confirm
    `gstack-review-log` was called and `gstack-review-read` was run at least
    once. If no plan file is in context (e.g. `/codex consult` against a
-   diff with no plan), this check short-circuits — checks 1-3 already
+   diff with no plan), this check short-circuits — checks 1-4 already
    short-circuit when no plan file exists.
 
 Failing this gate and calling ExitPlanMode anyway is a contract violation —
@@ -1179,7 +1370,9 @@ With focus (e.g., "security"):
 
 Review the changes on this branch against the base branch. Run `git diff origin/<base>` to see the diff. Focus specifically on SECURITY. Your job is to find every way an attacker could exploit this code. Think about injection vectors, auth bypasses, privilege escalation, data exposure, and timing attacks. Be adversarial."
 
-2. Run codex exec with **JSONL output** to capture reasoning traces and tool calls (5-minute timeout):
+2. Run codex exec with **JSONL output** to capture reasoning traces and tool calls.
+Use `timeout: 660000` on the Bash call — the gate sits ABOVE the 600s wrapper so the
+wrapper fires first with its explicit stall message:
 
 If the user passed `--xhigh`, use `"xhigh"` instead of `"high"`.
 
@@ -1192,8 +1385,8 @@ if [ -z "$PYTHON_CMD" ]; then
 fi
 # Fix 1+2: wrap with timeout (gtimeout/timeout fallback chain via probe helper),
 # capture stderr to $TMPERR for auth error detection (was: 2>/dev/null).
-TMPERR=${TMPERR:-$(mktemp "$TMP_ROOT/codex-err-XXXXXX.txt")}
-_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
+TMPERR=${TMPERR:-$(mktemp "$TMP_ROOT/codex-err-XXXXXX")}
+_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
 import sys, json
 turn_completed_count = 0
 for line in sys.stdin:
@@ -1291,8 +1484,8 @@ B) Start a new conversation
 
 2. Create temp files:
 ```bash
-TMPRESP=$(mktemp "$TMP_ROOT/codex-resp-XXXXXX.txt")
-TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX.txt")
+TMPRESP=$(mktemp "$TMP_ROOT/codex-resp-XXXXXX")
+TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX")
 ```
 
 3. **Plan review auto-detection:** If the user's prompt is about reviewing a plan,
@@ -1335,7 +1528,10 @@ For non-plan consult prompts (user typed `/codex <question>`), still prepend the
 
 <user's question>"
 
-4. Run codex exec with **JSONL output** to capture reasoning traces (5-minute timeout):
+4. Run codex exec with **JSONL output** to capture reasoning traces. Use
+`timeout: 660000` on the Bash call (for both new and resumed sessions) — the gate
+sits ABOVE the 600s wrapper so the wrapper fires first with its explicit stall
+message:
 
 If the user passed `--xhigh`, use `"xhigh"` instead of `"medium"`.
 
@@ -1348,7 +1544,7 @@ if [ -z "$PYTHON_CMD" ]; then
   exit 1
 fi
 # Fix 1: wrap with timeout (gtimeout/timeout fallback chain via probe helper)
-_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
+_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -1392,6 +1588,14 @@ elif [ "$_CODEX_EXIT" != "0" ]; then
 fi
 ```
 
+**Session-cost reality (#2387, measured):** every `codex exec` call — resumed
+or fresh — pays Codex's ~21K-token session prelude (its skill catalogue +
+instructions); `resume` does NOT amortize it (a measured resume came in
+slightly ABOVE a fresh call). Resume buys conversational continuity, never
+token savings. So: prefer ONE codex call per skill where the workflow allows,
+batch questions into that call, and reach for resume only when the follow-up
+genuinely needs the prior session's context.
+
 For a **resumed session** (user chose "Continue"):
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
@@ -1402,7 +1606,7 @@ if [ -z "$PYTHON_CMD" ]; then
 fi
 cd "$_REPO_ROOT" || exit 1
 # Fix 1: wrap with timeout (gtimeout/timeout fallback chain via probe helper)
-_gstack_codex_timeout_wrapper 600 codex exec resume <session-id> "<prompt>" -c 'sandbox_mode="read-only"' -c 'model_reasoning_effort="medium"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
+_gstack_codex_timeout_wrapper 600 codex exec resume <session-id> "<prompt>" -c 'sandbox_mode="read-only"' -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
 <same python streaming parser as above, with flush=True on all print() calls>
 "
 # Fix 1: same hang detection pattern as new-session block
@@ -1463,7 +1667,8 @@ The reason must engage with a specific Codex insight and compare against an alte
 
 **Model:** No model is hardcoded — codex uses whatever its current default is (the frontier
 agentic coding model). This means as OpenAI ships newer models, /codex automatically
-uses them. If the user wants a specific model, pass `-m` through to codex.
+uses them. If the user wants a specific model, pass it through — but the flag differs
+by mode (see below).
 
 **Reasoning effort (per-mode defaults):**
 - **Review (2A):** `high` — bounded diff input, needs thoroughness but not max tokens
@@ -1474,11 +1679,24 @@ uses them. If the user wants a specific model, pass `-m` through to codex.
 tasks (OpenAI issues #8545, #8402, #6931). Users can override with `--xhigh` flag
 (e.g., `/codex review --xhigh`) when they want maximum reasoning and are willing to wait.
 
-**Web search:** All codex commands use `--enable web_search_cached` so Codex can look up
-docs and APIs during review. This is OpenAI's cached index — fast, no extra cost.
+**Web search:** All codex commands pass `-c 'web_search="cached"'` so `codex exec`
+invocations can look up docs and APIs during review. This is OpenAI's cached index —
+fast, no extra cost. Unlike the legacy `--enable`-based spelling (deprecated by
+codex >=0.144), the `-c` form explicitly overrides any top-level
+`web_search` setting in `~/.codex/config.toml`. Note: native `codex review` disables
+web search regardless of configuration, so on the default Review path the flag is a
+harmless no-op — only exec-based modes actually search.
 
-If the user specifies a model (e.g., `/codex review -m gpt-5.1-codex-max`
-or `/codex challenge -m gpt-5.2`), pass the `-m` flag through to codex.
+If the user specifies a model (e.g., `/codex review -m gpt-5.1-codex-max` or
+`/codex challenge -m gpt-5.2`), the flag to pass depends on the underlying command:
+
+- **Exec-based modes** (Challenge, Consult, and the custom-instructions Review path)
+  run `codex exec`, which takes `-m <model>` — pass it through as-is.
+- **Default Review mode** runs `codex review`, which REJECTS `-m`
+  (`error: unexpected argument '-m' found`, verified on 0.147.0 — its help lists no
+  `-m`/`--model` option). Translate the user's `-m <model>` into the config form:
+  `-c model="<model>"`. Same shape as the `--base`-vs-prompt incompatibility above:
+  review mode takes its knobs through flags/config, never through extra arguments.
 
 ---
 
@@ -1497,9 +1715,39 @@ If token count is not available, display: `Tokens: unknown`
 - **Binary not found:** Detected in Step 0. Stop with install instructions.
 - **Auth error:** Codex prints an auth error to stderr. Surface the error:
   "Codex authentication failed. Run `codex login` in your terminal to authenticate via ChatGPT."
-- **Timeout (Bash outer gate):** If the Bash call times out (5 min for Review/Challenge, 10 min for Consult), tell the user:
+- **Timeout (Bash outer gate):** Every Bash gate sits ABOVE its inner wrapper (360s gate
+  over the 330s review wrapper; 660s gate over the 600s challenge/consult wrappers), so
+  the wrapper's exit-124 path normally fires first with its explicit message. If the Bash
+  call itself times out anyway (wrapper unavailable AND codex hung), tell the user:
   "Codex timed out. The prompt may be too large or the API may be slow. Try again or use a smaller scope."
 - **Timeout (inner `timeout` wrapper, exit 124):** If the shell `timeout 600` wrapper fires first, the skill's hang-detection block auto-logs a telemetry event + operational learning and prints: "Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check `~/.codex/logs/`." No extra action needed.
+- **`the argument '[PROMPT]' cannot be used with '--base <BRANCH>'`:** a prompt argument
+  leaked into a scoped `codex review`. This fails instantly, before any API call, so it
+  looks like a hang-free "no output" — do not misread it as a model stall. Drop the
+  prompt: the scope flags (`--base`, `--commit`, `--uncommitted`) carry the scope on
+  their own. If the prompt was custom review instructions, run them through `codex exec`
+  instead (Step 2A, custom-instructions path). Do **not** fix it by removing `--base` and
+  keeping the prompt — that parses, but silently reviews the uncommitted working tree
+  instead of the branch diff.
+- **Review says "no changes" on a branch that clearly has changes:** the scope flag is
+  missing or wrong. A prompt-only `codex review` defaults to uncommitted changes, so a
+  clean working tree reads as an empty review even when `<base>...HEAD` is large. Confirm
+  `--base <base>` is actually on the command line.
+- **Model not supported (HTTP 400):** stderr shows
+  `The '<model>' model is not supported when using Codex with a ChatGPT account`
+  (a `status: 400` / `invalid_request_error` naming a model). This is an
+  entitlement/stale-pin problem, not an auth or network failure, and the auth probe
+  cannot catch it. The rejected model comes from the `model = "..."` line in
+  `~/.codex/config.toml`. Recovery, in order:
+  1. Read `~/.codex/config.toml` and check the `[notice.model_migrations]` table —
+     Codex records the intended replacement there (e.g. `"gpt-5.4" = "gpt-5.5"`).
+  2. Retry with the replacement model explicitly: exec-based modes (Challenge,
+     Consult, custom-instructions Review) take `-m <replacement>`; the default
+     Review path uses `codex review`, which REJECTS `-m` — pass
+     `-c model="<replacement>"` there instead.
+  3. Tell the user the one-line permanent fix: update the `model = ` pin in
+     `~/.codex/config.toml`.
+  Never present this as a model stall or a PASS — it is a fail-closed gate result.
 - **Empty response:** If `$TMPRESP` is empty or doesn't exist, tell the user:
   "Codex returned no response. Check stderr for errors."
 - **Session resume failure:** If resume fails, delete the session file and start fresh.
@@ -1512,7 +1760,10 @@ If token count is not available, display: `Tokens: unknown`
 - **Present output verbatim.** Do not truncate, summarize, or editorialize Codex's output
   before showing it. Show it in full inside the CODEX SAYS block.
 - **Add synthesis after, not instead of.** Any Claude commentary comes after the full output.
-- **5-minute timeout** on all Bash calls to codex (`timeout: 300000`).
+- **Bash gate above the wrapper.** Every Bash call to codex sets its `timeout`
+  parameter ABOVE the inner `_gstack_codex_timeout_wrapper` budget (Review:
+  `timeout: 360000` over the 330s wrapper; Challenge/Consult: `timeout: 660000`
+  over the 600s wrappers) so the wrapper fires first with a diagnosable exit 124.
 - **No double-reviewing.** If the user already ran `/review`, Codex provides a second
   independent opinion. Do not re-run Claude Code's own review.
 - **Detect skill-file rabbit holes.** After receiving Codex output, scan for signs
