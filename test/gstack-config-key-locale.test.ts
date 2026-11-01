@@ -28,6 +28,7 @@ function run(args: string[]) {
     // live tree (observed in the free-tests CI job). Relink behavior itself is
     // covered in isolation by test/relink.test.ts's mock install.
     env: { ...process.env, GSTACK_STATE_ROOT: stateRoot, GSTACK_SETUP_RUNNING: "1" },
+    timeout: 30_000,
   });
 
   return {
@@ -46,13 +47,13 @@ afterEach(() => {
 });
 
 describe("gstack-config key validation is locale-independent", () => {
-  test("get, has, and set all validate ASCII ranges under the C locale", () => {
+  test("get, get --stored, has, set and unset all validate ASCII ranges under the C locale", () => {
     const source = fs.readFileSync(CONFIG, "utf8");
     const guardedValidators = source.match(
       /LC_ALL=C grep -qE '\^\[a-zA-Z0-9_\]\+\(@\[a-zA-Z0-9\]\+\)\?\$'/g,
     );
 
-    expect(guardedValidators).toHaveLength(3);
+    expect(guardedValidators).toHaveLength(5);
   });
 
   test("round-trips existing keys that contain i", () => {

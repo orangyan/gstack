@@ -24,6 +24,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawnSync } from 'child_process';
+import { slugCacheFile } from '../lib/bin-context';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const HOOK = path.join(ROOT, 'hosts', 'claude', 'hooks', 'question-preference-hook');
@@ -38,9 +39,16 @@ beforeEach(() => {
   cwdSlug = 'fixture-slug';
   fs.mkdirSync(path.join(stateRoot, 'projects', cwdSlug), { recursive: true });
   // Real directory that the hook can chdir() into. gstack-slug derives the
-  // slug from the basename of this cwd (no .git => basename fallback path).
+  // slug from the basename of this cwd (no .git => basename fallback path),
+  // so the auto-decided event log (written via gstack-question-log) lands in
+  // the same bucket the cache entry below names.
   fixtureCwd = path.join(stateRoot, cwdSlug);
   fs.mkdirSync(fixtureCwd, { recursive: true });
+  // The hook reads the project bucket from gstack-slug's versioned slug-cache
+  // entry (#2901), which the skill preamble writes before any question.
+  const cacheFile = slugCacheFile(stateRoot, fixtureCwd);
+  fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+  fs.writeFileSync(cacheFile, `v2:${cwdSlug}`);
 });
 
 afterEach(() => {
@@ -82,6 +90,12 @@ function runHook(stdin: object, cwd?: string, extraEnv?: Record<string, string>)
   // via extraEnv.
   delete env.CONDUCTOR_WORKSPACE_PATH;
   delete env.CONDUCTOR_PORT;
+  // Same reasoning for the spawned markers (#2733): running the suite inside
+  // an OpenClaw/spawned-marked session would flip the [conductor] prose deny
+  // into the [conductor][spawned] auto-choose deny. Spawned cases opt back in
+  // explicitly via extraEnv.
+  delete env.OPENCLAW_SESSION;
+  delete env.GSTACK_SESSION_KIND;
   env.GSTACK_QUESTION_LOG_NO_DERIVE = '1';
   if (extraEnv) Object.assign(env, extraEnv);
   const res = spawnSync(HOOK, [], {
@@ -89,6 +103,7 @@ function runHook(stdin: object, cwd?: string, extraEnv?: Record<string, string>)
     input: JSON.stringify({ ...stdin, cwd: cwd || fixtureCwd }),
     encoding: 'utf-8',
     cwd: ROOT,
+    timeout: 30_000,
   });
   let parsed: any = null;
   try { parsed = JSON.parse(res.stdout || '{}'); } catch {}
@@ -181,7 +196,7 @@ describe('passes through (no enforcement)', () => {
       if (v !== undefined) env[k] = v;
     }
     env.GSTACK_STATE_ROOT = stateRoot;
-    const res = spawnSync(HOOK, [], { env, input: '', encoding: 'utf-8' });
+    const res = spawnSync(HOOK, [], { env, input: '', encoding: 'utf-8', timeout: 30_000 });
     expect(res.status).toBe(0);
     expect(res.stdout).toBe('');
   });
@@ -527,6 +542,210 @@ describe('Conductor prose redirect', () => {
     );
     expectPassThrough(r);
   });
+
+  test('prose deny carries the spawned-subagent escape sentence (#2733)', () => {
+    // A per-command env prefix in a subagent's bash can never reach this hook
+    // (hooks inherit the harness env), so the deny TEXT must carry the escape
+    // hatch — otherwise a marked subagent that slips and calls AUQ is
+    // instructed to prose-STOP, recreating the bug through the hook layer.
+    const r = runHook({
+      session_id: 'c7',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-c7',
+      tool_input: {
+        questions: [
+          { question: '<gstack-qid:test-q> Need approval?', options: ['A) Yes (recommended)', 'B) No'] },
+        ],
+      },
+    }, undefined, CONDUCTOR);
+    const reason = r.parsed?.hookSpecificOutput?.permissionDecisionReason ?? '';
+    expect(reason).toMatch(/spawned subagent[\s\S]*auto-choose the recommended option/i);
+    // Destructive exclusion rides the same sentence (unified semantics).
+    expect(reason).toMatch(/destructive or irreversible gate[\s\S]*conservative/i);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Conductor + env-detected spawned: auto-choose deny, not prose (#2733)
+// ----------------------------------------------------------------------
+
+describe('Conductor spawned deny (#2733)', () => {
+  const Q = {
+    questions: [
+      { question: '<gstack-qid:test-q> Bump VERSION?', options: ['A) Skip (recommended)', 'B) Bump'] },
+    ],
+  };
+
+  test('Conductor + OPENCLAW_SESSION → [conductor][spawned] auto-choose deny, not prose', () => {
+    const r = runHook(
+      { session_id: 's1', tool_name: 'AskUserQuestion', tool_use_id: 'tu-s1', tool_input: Q },
+      undefined,
+      { CONDUCTOR_PORT: '55070', OPENCLAW_SESSION: '1' },
+    );
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    const reason = r.parsed?.hookSpecificOutput?.permissionDecisionReason ?? '';
+    expect(reason).toContain('[conductor][spawned]');
+    expect(reason).toMatch(/auto-choose the recommended option/i);
+    expect(reason).not.toMatch(/reply with a letter/i);
+  });
+
+  test('Conductor + GSTACK_SESSION_KIND=spawned env → same auto-choose deny', () => {
+    const r = runHook(
+      { session_id: 's2', tool_name: 'AskUserQuestion', tool_use_id: 'tu-s2', tool_input: Q },
+      undefined,
+      { CONDUCTOR_WORKSPACE_PATH: '/Users/x/conductor/ws', GSTACK_SESSION_KIND: 'spawned' },
+    );
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    const reason = r.parsed?.hookSpecificOutput?.permissionDecisionReason ?? '';
+    expect(reason).toContain('[conductor][spawned]');
+    expect(reason).toMatch(/never auto-approve a destructive or irreversible option/i);
+  });
+
+  test('Conductor + invalid GSTACK_SESSION_KIND value → prose deny, not spawned (strict-equality fall-through)', () => {
+    // spawnedByEnv() mirrors bin/gstack-session-kind step 0: only the exact
+    // value "spawned" is honored. A reserved/typo'd value inside Conductor
+    // must fall through to the PROSE deny — loosening the comparison to
+    // truthiness would auto-choose past a human who IS watching.
+    const r = runHook(
+      { session_id: 's3', tool_name: 'AskUserQuestion', tool_use_id: 'tu-s3', tool_input: Q },
+      undefined,
+      { CONDUCTOR_PORT: '55071', GSTACK_SESSION_KIND: 'bogus' },
+    );
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    const reason = r.parsed?.hookSpecificOutput?.permissionDecisionReason ?? '';
+    expect(reason).not.toContain('[conductor][spawned]');
+    expect(reason).toMatch(/reply with a letter/i);
+  });
+
+  test('spawned marker WITHOUT Conductor → pass-through (deny branch stays nested under isConductor)', () => {
+    // Outside Conductor the tool is reliable; the spawned auto-choose deny is
+    // a Conductor-only rescue. Hoisting spawnedByEnv() above isConductor()
+    // would deny AUQ in every OpenClaw session regardless of host — pin the
+    // nesting.
+    const r = runHook(
+      {
+        session_id: 's4',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: 'tu-s4',
+        tool_input: {
+          questions: [
+            { question: '<gstack-qid:spawned-nc> Bump VERSION?', options: ['A) Skip (recommended)', 'B) Bump'] },
+          ],
+        },
+      },
+      undefined,
+      { OPENCLAW_SESSION: '1' },
+    );
+    expectPassThrough(r);
+  });
+
+  test('both hooks source their spawned directive from the shared constant (drift guard)', () => {
+    const hooksDir = path.join(ROOT, 'hosts', 'claude', 'hooks');
+    for (const f of ['question-preference-hook.ts', 'auq-error-fallback-hook.ts']) {
+      const src = fs.readFileSync(path.join(hooksDir, f), 'utf-8');
+      expect(src, `${f} must import the shared spawned directive`).toContain("from './spawned-directive'");
+    }
+  });
+
+  test('spawned deny annotates one-way doors per question (#2733 review)', () => {
+    // The auto-choose deny performs no preference lookup, so destructive
+    // questions get a deterministic per-question annotation — a destructive
+    // option marked (recommended) must not be auto-approved on prose alone.
+    const r = runHook(
+      {
+        session_id: 's3',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: 'tu-s3',
+        tool_input: {
+          questions: [
+            { question: '<gstack-qid:test-q> Force-push and overwrite the remote branch, deleting its history?', options: ['A) Force-push (recommended)', 'B) Abort'] },
+          ],
+        },
+      },
+      undefined,
+      { CONDUCTOR_PORT: '55070', OPENCLAW_SESSION: '1' },
+    );
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    const reason = r.parsed?.hookSpecificOutput?.permissionDecisionReason ?? '';
+    expect(reason).toContain('[conductor][spawned]');
+    expect(reason).toMatch(/one-way door detected: Q1/);
+    expect(reason).toMatch(/conservative non-destructive option/);
+    // The driving env var is named (tamper visibility)...
+    expect(reason).toContain('spawned driver: OPENCLAW_SESSION');
+    // ...and the machine-resolved gate leaves a forensic record (the deny
+    // prevents PostToolUse capture; this branch must log its own events).
+    const f = path.join(stateRoot, 'projects', cwdSlug, 'question-log.jsonl');
+    const events = fs.existsSync(f)
+      ? fs.readFileSync(f, 'utf-8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      : [];
+    expect(events.some((e) => e.source === 'spawned-env-deny')).toBe(true);
+  });
+
+  test('spawned deny catches a destructive OPTION behind a bland question (codex finding)', () => {
+    const r = runHook(
+      {
+        session_id: 's4',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: 'tu-s4',
+        tool_input: {
+          questions: [
+            { question: '<gstack-qid:test-q> Proceed with the plan?', options: ['A) Force-push over the remote branch (recommended)', 'B) Abort'] },
+          ],
+        },
+      },
+      undefined,
+      { CONDUCTOR_PORT: '55070', GSTACK_SESSION_KIND: 'spawned' },
+    );
+    expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    const reason = r.parsed?.hookSpecificOutput?.permissionDecisionReason ?? '';
+    expect(reason).toMatch(/one-way door detected: Q1/);
+    expect(reason).toContain('spawned driver: GSTACK_SESSION_KIND');
+  });
+
+  test('cross-surface destructive-policy drift guard: every spawned surface carries the canonical phrase', () => {
+    // The conservative-continue destructive policy lives on four surfaces
+    // (shared hook constant, AUQ resolver rule, skill-start spawned block,
+    // ship dispatch prompt). Phrasings vary; the canonical core must not.
+    const surfaces = [
+      path.join(ROOT, 'hosts', 'claude', 'hooks', 'spawned-directive.ts'),
+      path.join(ROOT, 'hosts', 'claude', 'hooks', 'auq-error-fallback-hook.ts'),
+      path.join(ROOT, 'scripts', 'resolvers', 'preamble', 'generate-ask-user-format.ts'),
+      path.join(ROOT, 'bin', 'gstack-skill-start'),
+      path.join(ROOT, 'ship', 'sections', 'documentation.md.tmpl'),
+    ];
+    for (const f of surfaces) {
+      const src = fs.readFileSync(f, 'utf-8');
+      expect(src, `${path.basename(f)} lost the canonical destructive-policy phrase`).toContain('conservative non-destructive');
+    }
+  });
+
+  test('spawnedByEnv() parity with bin/gstack-session-kind over the spawned env matrix', () => {
+    // spawnedByEnv mirrors session-kind steps 0-1 by hand; this pins the
+    // mirror so a new ambient spawned marker added to the script cannot
+    // silently leave Conductor-spawned sessions on the prose-STOP path.
+    const { spawnedByEnv } = require(path.join(ROOT, 'hosts', 'claude', 'hooks', 'spawned-directive.ts'));
+    const BIN = path.join(ROOT, 'bin', 'gstack-session-kind');
+    const cases: Array<Record<string, string>> = [
+      { OPENCLAW_SESSION: '1' },
+      { GSTACK_SESSION_KIND: 'spawned' },
+      { GSTACK_SESSION_KIND: 'spawned', GSTACK_HEADLESS: '1' },
+      { GSTACK_SESSION_KIND: 'bogus' },
+      { GSTACK_SESSION_KIND: 'headless' },
+      { CONDUCTOR_PORT: '5' },
+      {},
+    ];
+    for (const env of cases) {
+      const scriptKind = spawnSync(BIN, [], {
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...env },
+        encoding: 'utf-8',
+        timeout: 30_000,
+      }).stdout.trim();
+      expect(
+        spawnedByEnv(env),
+        `parity break on env ${JSON.stringify(env)}: script says ${scriptKind}`,
+      ).toBe(scriptKind === 'spawned');
+    }
+  });
 });
 
 // ----------------------------------------------------------------------
@@ -573,5 +792,91 @@ describe('auto-decided event tagging', () => {
     });
     const markerPath = path.join(stateRoot, 'sessions', 's14', '.auto-decided-tu-14');
     expect(fs.existsSync(markerPath)).toBe(true);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Project bucket = gstack-slug's versioned cache (#2901)
+// ----------------------------------------------------------------------
+
+describe('project bucket follows gstack-slug (#2901)', () => {
+  const askPayload = (id: string) => ({
+    session_id: `s-slug-${id}`,
+    tool_name: 'AskUserQuestion',
+    tool_use_id: `tu-slug-${id}`,
+    tool_input: {
+      questions: [{ question: '<gstack-qid:ship-pre-landing-review-fix> Fix it?', options: ['A) Fix (recommended)', 'B) Skip'] }],
+    },
+  });
+
+  function originRepo(dirName: string, origin: string): string {
+    const dir = path.join(stateRoot, 'repos', dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    spawnSync('git', ['init', '-q'], { cwd: dir, timeout: 30_000 });
+    spawnSync('git', ['remote', 'add', 'origin', origin], { cwd: dir, timeout: 30_000 });
+    return dir;
+  }
+
+  function writePrefViaBin(cwd: string): string {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    env.GSTACK_STATE_ROOT = stateRoot;
+    delete env.GSTACK_HOME;
+    delete env.GSTACK_PROJECT_SLUG;
+    const r = spawnSync(
+      path.join(ROOT, 'bin', 'gstack-question-preference'),
+      ['--write', JSON.stringify({ question_id: 'ship-pre-landing-review-fix', preference: 'never-ask', source: 'plan-tune' })],
+      { cwd, env, encoding: 'utf-8', timeout: 30_000 },
+    );
+    expect(r.status).toBe(0);
+    return r.stdout + r.stderr;
+  }
+
+  test('never-ask written by gstack-question-preference in an origin-remote repo is enforced', () => {
+    for (const [dirName, origin, bucket] of [
+      ['LovedVoice-checkout', 'git@github.com:kvzn/LovedVoice.git', 'kvzn-LovedVoice'],
+      ['nested-checkout', 'https://gitlab.com/customer-a/product/repo.git', 'product-repo-5eca1fe041984543'],
+    ] as const) {
+      const repo = originRepo(dirName, origin);
+      writePrefViaBin(repo);
+      expect(fs.existsSync(path.join(stateRoot, 'projects', bucket, 'question-preferences.json'))).toBe(true);
+      const r = runHook(askPayload(dirName), repo);
+      expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('[plan-tune auto-decide] ship-pre-landing-review-fix → A) Fix');
+    }
+  });
+
+  test('unresolved identity asks (even with a global never-ask) and records why', () => {
+    writeGlobalPref('ship-pre-landing-review-fix', 'never-ask');
+    const unknownCwd = path.join(stateRoot, 'never-resolved');
+    fs.mkdirSync(unknownCwd, { recursive: true });
+    expectPassThrough(runHook(askPayload('unresolved'), unknownCwd));
+    const log = fs.readFileSync(path.join(stateRoot, 'hook-errors.log'), 'utf-8');
+    expect(log).toContain('never-ask not applied to ship-pre-landing-review-fix, asking instead: project identity unresolved');
+    expect(log).toContain(unknownCwd);
+  });
+
+  test('an unversioned (pre-upgrade) cache entry is not trusted: asks', () => {
+    writeProjectPref('ship-pre-landing-review-fix', 'never-ask');
+    fs.writeFileSync(slugCacheFile(stateRoot, fixtureCwd), cwdSlug);
+    expectPassThrough(runHook(askPayload('unversioned')));
+  });
+
+  test('GSTACK_PROJECT_SLUG pins the bucket; "." and ".." pins are ignored', () => {
+    const pinnedCwd = path.join(stateRoot, 'pinned-cwd');
+    fs.mkdirSync(pinnedCwd, { recursive: true });
+    fs.mkdirSync(path.join(stateRoot, 'projects', 'pinned'), { recursive: true });
+    fs.writeFileSync(
+      path.join(stateRoot, 'projects', 'pinned', 'question-preferences.json'),
+      JSON.stringify({ 'ship-pre-landing-review-fix': 'never-ask' }),
+    );
+    const pinned = runHook(askPayload('pinned'), pinnedCwd, { GSTACK_PROJECT_SLUG: 'pinned' });
+    expect(pinned.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+
+    // Where a ".." pin would point (projects/../): must never be read.
+    fs.writeFileSync(path.join(stateRoot, 'question-preferences.json'), JSON.stringify({ 'ship-pre-landing-review-fix': 'never-ask' }));
+    for (const pin of ['..', '.']) {
+      expectPassThrough(runHook(askPayload(`dots${pin.length}`), pinnedCwd, { GSTACK_PROJECT_SLUG: pin }));
+    }
   });
 });

@@ -49,7 +49,7 @@ const ALLOWED_FILES = new Set<string>([
 const SKIP_DIRS = new Set<string>([
   'node_modules', '.git', '.github', 'dist', 'test', 'docs',
   // Vendored binaries / build outputs.
-  'browse/dist', 'design/dist', 'extension/node_modules',
+  'browse/dist', 'design/dist', 'make-pdf/dist', 'extension/node_modules',
   // The plan file's directory was already in ALLOWED_FILES; skip docs/ entirely.
 ]);
 
@@ -126,14 +126,6 @@ describe('#1671 invariant: no production code writes to builder-profile.jsonl', 
       );
     }
     expect(offending).toEqual([]);
-  });
-
-  test('office-hours/SKILL.md uses --log-session, not raw echo append', () => {
-    const skill = fs.readFileSync(path.join(ROOT, 'office-hours/SKILL.md'), 'utf-8');
-    // The two known writer call-sites must use the new subcommand.
-    expect(skill).toContain('gstack-developer-profile --log-session');
-    // And must NOT contain the old echo-append pattern.
-    expect(skill).not.toMatch(/echo\s+['"][^'"]*['"]?\s*>>\s*["'][^"']*builder-profile\.jsonl/);
   });
 
   test('office-hours/SKILL.md.tmpl uses --log-session, not raw echo append', () => {

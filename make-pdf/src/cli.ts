@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * make-pdf CLI — argv parse, dispatch, exit.
  *
@@ -7,11 +7,12 @@
  *   stderr: progress spinner per stage, final "Done in Xs. N pages."
  *   --quiet: suppress progress. Errors still print.
  *   --verbose: per-stage timings.
- *   exit 0 success / 1 bad args / 2 render error / 3 Paged.js timeout / 4 browse unavailable.
+ *   exit 0 success / 1 bad args / 2 render error / 3 TOC page numbers failed / 4 no browser
+ *   (Aside not running AND gstack's own browser not built).
  */
 
 import { COMMANDS } from "./commands";
-import { ExitCode, BrowseClientError } from "./types";
+import { ExitCode, BrowserUnavailableError } from "./types";
 import type { GenerateOptions, PreviewOptions } from "./types";
 
 interface ParsedArgs {
@@ -39,6 +40,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
     printUsage();
     process.exit(ExitCode.Success);
   }
+  // setup's and gstack-doctor's launch probe (#2595): the version command needs no browser.
+  if (args[0] === "--version") return { command: "version", positional: [], flags: {} };
 
   // First non-flag arg is the command.
   let command = "";
@@ -88,7 +91,7 @@ function printUsage(): void {
   lines.push("");
   lines.push("Document structure:");
   lines.push("  --cover                   Add a cover page.");
-  lines.push("  --toc                     Generate clickable table of contents.");
+  lines.push("  --toc                     Generate clickable table of contents with page numbers.");
   lines.push("  --no-chapter-breaks       Don't start a new page at every H1.");
   lines.push("");
   lines.push("Branding:");
@@ -119,7 +122,7 @@ function printUsage(): void {
   lines.push("  $P generate --watermark DRAFT memo.md draft.pdf");
   lines.push("  $P preview letter.md");
   lines.push("");
-  lines.push("Run `$P setup` to verify browse + Chromium + pdftotext install.");
+  lines.push("Run `$P setup` to verify the browser (Aside, or gstack's own fallback) + pdftotext install.");
   console.error(lines.join("\n"));
 }
 
@@ -265,17 +268,17 @@ async function main(): Promise<void> {
         process.exit(ExitCode.BadArgs);
     }
   } catch (err: any) {
-    if (err instanceof BrowseClientError) {
+    if (err instanceof BrowserUnavailableError) {
       console.error(`$P: ${err.message}`);
-      process.exit(ExitCode.BrowseUnavailable);
+      process.exit(ExitCode.BrowserUnavailable);
     }
     if (err?.code === "ENOENT") {
       console.error(`$P: file not found: ${err.path ?? err.message}`);
       process.exit(ExitCode.BadArgs);
     }
-    if (err?.name === "PagedJsTimeout") {
-      console.error(`$P: ${err.message}`);
-      process.exit(ExitCode.PagedJsTimeout);
+    if (err?.name === "TocPaginationError") {
+      console.error(`$P: --toc: ${err.message}`);
+      process.exit(ExitCode.TocPagination);
     }
     console.error(`$P: ${err?.message ?? String(err)}`);
     if (parsed.flags.verbose && err?.stack) {

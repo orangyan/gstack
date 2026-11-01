@@ -5,8 +5,8 @@
  * Outputs the absolute path to the browse binary on stdout, or exits 1 if not found.
  */
 
-import { accessSync, constants } from 'fs';
-import { join } from 'path';
+import { accessSync, constants, readFileSync } from 'fs';
+import { dirname, join } from 'path';
 import { homedir } from 'os';
 
 // ─── Binary Discovery ───────────────────────────────────────────
@@ -27,8 +27,8 @@ function getGitRoot(): string | null {
 
 // Probe a path for executability. accessSync(X_OK) checks the executable
 // bit on Linux/macOS and degrades to an existence check on Windows (no
-// true execute bit). Mirrors make-pdf/src/browseClient.ts:159 /
-// make-pdf/src/pdftotext.ts:117.
+// true execute bit). Mirrors lib/aside-render.ts executable() /
+// make-pdf/src/pdftotext.ts.
 function isExecutable(p: string): boolean {
   try {
     accessSync(p, constants.X_OK);
@@ -42,7 +42,7 @@ function isExecutable(p: string): boolean {
 // build --compile` appends `.exe` to the output filename, so `browse` on
 // disk is actually `browse.exe`. After a bare-path probe, try the Windows
 // extensions. Linux/macOS behavior is unchanged. Mirrors the helper in
-// make-pdf/src/browseClient.ts:89 and make-pdf/src/pdftotext.ts:52.
+// lib/aside-render.ts (executable) and make-pdf/src/pdftotext.ts.
 function findExecutable(base: string): string | null {
   if (isExecutable(base)) return base;
   if (process.platform === 'win32') {
@@ -91,6 +91,13 @@ export function locateBinary(): string | null {
 // ─── Main ───────────────────────────────────────────────────────
 
 function main() {
+  // setup's and gstack-doctor's launch probe (#2595): no git, no discovery.
+  if (process.argv[2] === '--version') {
+    let version = 'unknown';
+    try { version = readFileSync(join(dirname(process.execPath), '.version'), 'utf8').trim() || version; } catch {}
+    console.log(version);
+    process.exit(0);
+  }
   const bin = locateBinary();
   if (!bin) {
     process.stderr.write('ERROR: browse binary not found. Run: cd <skill-dir> && ./setup\n');

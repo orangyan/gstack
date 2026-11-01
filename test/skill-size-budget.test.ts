@@ -1,9 +1,11 @@
 /**
  * Per-skill SKILL.md size budget regression (v1.46.0.0 T5).
  *
- * Asserts that no skill's generated SKILL.md grew beyond the v1.47.0.0
- * baseline. Catches preamble/resolver changes that bloat skills back to
- * the pre-compression size. Free — pure file IO + JSON diff.
+ * Asserts that no skill's startup context grew beyond the baseline: its
+ * generated SKILL.md, plus sections/preamble.md for a tier 2+ skill that
+ * points to the shared preamble (readSkillStartup), the same measure as the
+ * shrink floor below. Catches preamble/resolver changes that bloat skills
+ * back to the pre-compression size. Free — pure file IO + JSON diff.
  *
  * Baseline rebased v1.44.1 → v1.47.0.0 in the AskUserQuestion split-rule
  * PR after main merged GSTACK_PLAN_MODE + /spec, pushing the v1.44.1
@@ -14,8 +16,19 @@
  * compares LIVE eval runs (tool calls, turns, cost); this one compares
  * static SKILL.md sizes. Both gate-tier.
  *
- * The baseline lives at test/fixtures/parity-baseline-v1.47.0.0.json,
- * captured by scripts/capture-baseline.ts before any Phase A work landed.
+ * Baseline rebased v1.69.1.0 → v1.81.0.0: the Aside-first browser contract
+ * ({{ASIDE_SETUP}}) plus the gstack-browser fallback block now ride in every
+ * browsing skill (~9KB), which pushed benchmark and scrape past 1.5× of the
+ * v1.69.1.0 anchor. Deliberate, corpus-wide, receipted in the v1.81.0.0
+ * CHANGELOG; the v1.69.1.0 fixture is in git history.
+ *
+ * The previous baseline lived at test/fixtures/parity-baseline-v1.69.1.0.json,
+ * re-captured 2026-08-25 during token-reduction Phase 1 (bash consolidation
+ * moved ~11-13KB of inline preamble bash per skill into bin/gstack-skill-start
+ * and bin/gstack-skill-end — a deliberate corpus-wide shrink; receipt:
+ * gstack-context-bill --diff in PR #2691). The prior v1.47.0.0 fixture is in
+ * git history. Live pins at capture time: this test (shrink floor)
+ * and test/parity-suite.test.ts vs parity-baseline-v1.64.1.0.json (growth).
  *
  * Override:
  * - GSTACK_SIZE_BUDGET_RATIO=<n> changes the per-skill regression ratio.
@@ -35,9 +48,10 @@ import { execSync } from 'child_process';
 import { captureBaseline, extractDescription, type ParityBaseline } from './helpers/capture-parity-baseline';
 import { logBudgetOverride } from './helpers/budget-override';
 import { CARVED_SKILLS } from './helpers/carve-guards';
+import { readSkillStartup } from './helpers/skill-startup';
 
 const REPO_ROOT = path.resolve(import.meta.dir, '..');
-const BASELINE_PATH = path.join(REPO_ROOT, 'test', 'fixtures', 'parity-baseline-v1.47.0.0.json');
+const BASELINE_PATH = path.join(REPO_ROOT, 'test', 'fixtures', 'parity-baseline-v1.81.0.0.json');
 
 // Default per-skill ratio is 1.50 (50% growth tolerance). Adjusted v1.52.0.0
 // (cathedral cap audit) from 1.05 → 1.50: a 5% ratio tripped on legitimate
@@ -48,6 +62,9 @@ const BASELINE_PATH = path.join(REPO_ROOT, 'test', 'fixtures', 'parity-baseline-
 // separately with a hard ceiling.
 const DEFAULT_RATIO = 1.50;
 const RATIO = Number(process.env.GSTACK_SIZE_BUDGET_RATIO) || DEFAULT_RATIO;
+/** What a skill loads at startup: SKILL.md plus a tier 2+ skill's shared sections/preamble.md. */
+const startupBytes = (skill: string): number =>
+  Buffer.byteLength(readSkillStartup(path.join(REPO_ROOT, skill, 'SKILL.md')), 'utf-8');
 
 interface Regression {
   skill: string;
@@ -57,11 +74,11 @@ interface Regression {
 }
 
 describe('SKILL.md size budget regression (gate, free)', () => {
-  test('parity-baseline-v1.47.0.0.json exists', () => {
+  test('parity-baseline-v1.81.0.0.json exists', () => {
     expect(fs.existsSync(BASELINE_PATH)).toBe(true);
   });
 
-  test('no skill exceeds v1.47.0.0 baseline size × ratio', () => {
+  test('no skill exceeds v1.81.0.0 baseline size × ratio', () => {
     const baseline: ParityBaseline = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf-8'));
     const current = captureBaseline({ repoRoot: REPO_ROOT });
 
@@ -69,12 +86,13 @@ describe('SKILL.md size budget regression (gate, free)', () => {
     for (const [skill, before] of Object.entries(baseline.skills)) {
       const after = current.skills[skill];
       if (!after) continue; // skill removed since v1.44 — not a regression
-      if (after.skillMdBytes <= before.skillMdBytes * RATIO) continue;
+      const afterBytes = startupBytes(skill);
+      if (afterBytes <= before.skillMdBytes * RATIO) continue;
       regressions.push({
         skill,
         beforeBytes: before.skillMdBytes,
-        afterBytes: after.skillMdBytes,
-        growth: after.skillMdBytes / before.skillMdBytes,
+        afterBytes,
+        growth: afterBytes / before.skillMdBytes,
       });
     }
 
@@ -109,12 +127,13 @@ describe('SKILL.md size budget regression (gate, free)', () => {
 
   test('total corpus byte count does not regress past baseline × ratio', () => {
     const baseline: ParityBaseline = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf-8'));
-    const current = captureBaseline({ repoRoot: REPO_ROOT });
-    const ratio = current.totalCorpusBytes / baseline.totalCorpusBytes;
-    if (current.totalCorpusBytes <= baseline.totalCorpusBytes * RATIO) {
+    const currentBytes = Object.keys(captureBaseline({ repoRoot: REPO_ROOT }).skills)
+      .reduce((sum, skill) => sum + startupBytes(skill), 0);
+    const ratio = currentBytes / baseline.totalCorpusBytes;
+    if (currentBytes <= baseline.totalCorpusBytes * RATIO) {
       // eslint-disable-next-line no-console
       console.log(
-        `[skill-size-budget] corpus OK: ${baseline.totalCorpusBytes} → ${current.totalCorpusBytes} bytes (×${ratio.toFixed(3)})`,
+        `[skill-size-budget] corpus OK: ${baseline.totalCorpusBytes} → ${currentBytes} bytes (×${ratio.toFixed(3)})`,
       );
       return;
     }
@@ -123,13 +142,13 @@ describe('SKILL.md size budget regression (gate, free)', () => {
       logBudgetOverride({
         scope: 'skill-size-budget-corpus',
         reason: overrideReason,
-        details: { ratio: RATIO, observed: ratio, before: baseline.totalCorpusBytes, after: current.totalCorpusBytes },
+        details: { ratio: RATIO, observed: ratio, before: baseline.totalCorpusBytes, after: currentBytes },
       });
       return;
     }
     throw new Error(
       `Total corpus regressed past v1.47.0.0 baseline × ${RATIO}: ` +
-      `${baseline.totalCorpusBytes} → ${current.totalCorpusBytes} bytes (×${ratio.toFixed(3)}). ` +
+      `${baseline.totalCorpusBytes} → ${currentBytes} bytes (×${ratio.toFixed(3)}). ` +
       `Override: set GSTACK_SIZE_BUDGET_OVERRIDE_REASON to allow.`,
     );
   });
@@ -157,7 +176,7 @@ describe('SKILL.md size budget regression (gate, free)', () => {
    * sectioned invariant in parity-harness.ts (minBytes on skeleton+sections).
    * Add the remaining three here as they carve.
    */
-  test('no skill shrinks past 80% of v1.47.0.0 baseline (catches accidental body strip)', () => {
+  test('no skill shrinks past 80% of v1.69.1.0 baseline (catches accidental body strip)', () => {
     const baseline: ParityBaseline = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf-8'));
     const current = captureBaseline({ repoRoot: REPO_ROOT });
     const MIN_RATIO = 0.80; // a skill at <80% of its v1.44 size signals mass-deletion
@@ -177,10 +196,15 @@ describe('SKILL.md size budget regression (gate, free)', () => {
     //   preamble-tier frontmatter fell through `?? 4`). Their tiers are now
     //   declared correctly (1-2), shedding the tier-2..4 onboarding prose they
     //   never should have carried (-271 lines each for tier 1).
+    // - browse: the baseline measured the headless-browse skill with its ~17 KB
+    //   $B command reference + snapshot-flag tables inline. /browse drives the
+    //   Aside browser first and carries the Aside contract in the skeleton; the
+    //   command tables live in the carved browse/sections/command-list.md.
     const INTENTIONAL_SHRINKS = new Set<string>([
       'spec',
       'scrape', 'diagram', 'open-gstack-browser',
       'landing-report', 'pair-agent', 'skillify',
+      'browse',
     ]);
 
     const undershoots: Array<{
@@ -191,10 +215,13 @@ describe('SKILL.md size budget regression (gate, free)', () => {
       if (INTENTIONAL_SHRINKS.has(skill)) continue;
       const after = current.skills[skill];
       if (!after) continue; // skill removed since baseline — separate concern
-      const ratio = after.skillMdBytes / before.skillMdBytes;
+      // A tier 2+ skill's shared preamble moved to sections/preamble.md, which
+      // its SKILL.md requires at startup: measure what it loads, not the move.
+      const afterBytes = startupBytes(skill);
+      const ratio = afterBytes / before.skillMdBytes;
       if (ratio < MIN_RATIO) {
         undershoots.push({
-          skill, beforeBytes: before.skillMdBytes, afterBytes: after.skillMdBytes, ratio,
+          skill, beforeBytes: before.skillMdBytes, afterBytes, ratio,
         });
       }
     }
@@ -234,16 +261,18 @@ describe('SKILL.md size budget regression (gate, free)', () => {
     // estimate was a moving target: 4177 solo, 8356 and 8041 in two parallel
     // runs. A repo-budget ratchet measures the catalog that ships; CI always
     // checks the PR's committed tree anyway.
-    const trackedPaths = execSync('git ls-files -- "*/SKILL.md"', { cwd: REPO_ROOT, encoding: 'utf-8' })
+    // List paths from HEAD too: a staged-but-uncommitted skill is in the index
+    // but not yet in HEAD, so `git ls-files` + `git show HEAD:` disagree.
+    const trackedPaths = execSync('git ls-tree -r --name-only HEAD', { cwd: REPO_ROOT, encoding: 'utf-8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 })
       .split('\n')
-      .filter(Boolean)
-      .filter((p) => p.split('/').length === 2);
+      .filter((p) => p.endsWith('/SKILL.md') && p.split('/').length === 2);
     let descriptionBytes = 0;
     for (const rel of trackedPaths) {
       const committed = execSync(`git show HEAD:${JSON.stringify(rel)}`, {
         cwd: REPO_ROOT,
         encoding: 'utf-8',
         maxBuffer: 8 * 1024 * 1024,
+        timeout: 30_000,
       });
       descriptionBytes += Buffer.byteLength(extractDescription(committed), 'utf-8');
     }

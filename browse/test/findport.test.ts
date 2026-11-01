@@ -160,7 +160,7 @@ describe('findPort / isPortAvailable', () => {
       }
 
       test();
-    `], { stdout: 'pipe', stderr: 'pipe' });
+    `], { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 });
 
     const output = result.stdout.toString().trim();
     // Confirms the polyfill's stop() is fire-and-forget — callers
@@ -171,25 +171,20 @@ describe('findPort / isPortAvailable', () => {
   test('net.createServer approach does not have the race condition', async () => {
     // Prove the fix: net.createServer with proper async bind/close
     // releases the port cleanly
-    const result = Bun.spawnSync(['node', '-e', `
+    const result = Bun.spawnSync(['node', '-e', ` // timeout in trailing options
       const net = require('net');
 
       async function testFix() {
-        const port = 10000 + Math.floor(Math.random() * 50000);
-
-        // Simulate the NEW isPortAvailable: proper async bind/close
-        const isFree = await new Promise((resolve) => {
+        // Ask the OS for an available test port. A random port may already
+        // belong to another parallel test or local service.
+        const port = await new Promise((resolve, reject) => {
           const srv = net.createServer();
-          srv.once('error', () => resolve(false));
-          srv.listen(port, '127.0.0.1', () => {
-            srv.close(() => resolve(true));
+          srv.once('error', reject);
+          srv.listen(0, '127.0.0.1', () => {
+            const allocatedPort = srv.address().port;
+            srv.close((error) => error ? reject(error) : resolve(allocatedPort));
           });
         });
-
-        if (!isFree) {
-          console.log('PORT_BUSY');
-          return;
-        }
 
         // Immediately try to bind — should succeed because close()
         // completed before the Promise resolved
@@ -204,9 +199,13 @@ describe('findPort / isPortAvailable', () => {
         console.log(canBind ? 'FIX_WORKS' : 'FIX_BROKEN');
       }
 
-      testFix();
-    `], { stdout: 'pipe', stderr: 'pipe' });
+      testFix().catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+    `], { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 });
 
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
     const output = result.stdout.toString().trim();
     expect(output).toBe('FIX_WORKS');
   });

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-egress — the auditor's view of the receipts ledger.
  *
@@ -24,19 +24,13 @@
  */
 
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import {
   egressLedgerPath,
   listReceipts,
   resolveEgressHome,
   verifyLedger,
 } from '../lib/egress-receipt';
-
-// import.meta.dir is Windows-safe; new URL(import.meta.url).pathname yields
-// '/C:/...' with percent-encoded spaces there, which would make the
-// gstack-config spawn silently fail and grants report every default. Matches
-// the sibling bin/*.ts convention.
-const BIN_DIR = import.meta.dir;
+import { readConfigKey } from '../lib/state-root';
 
 /**
  * Strip control characters (incl. ANSI escapes) from ledger-derived strings
@@ -64,11 +58,9 @@ function usage(message: string): never {
   process.exit(2);
 }
 
+/** The shared config reader (lib/state-root.ts); '' when unset (callers apply gstack-config's defaults). */
 function configGet(key: string): string {
-  const result = spawnSync(path.join(BIN_DIR, 'gstack-config'), ['get', key], {
-    encoding: 'utf-8',
-  });
-  return (result.stdout || '').trim();
+  return readConfigKey(key) ?? '';
 }
 
 function egressList(args: string[], home: string): number {
@@ -151,6 +143,7 @@ function egressGrants(args: string[], home: string): number {
   const syncMode = configGet('artifacts_sync_mode') || 'off';
   const repoVisibility = configGet('redact_repo_visibility') || 'unknown';
   const prepushHook = configGet('redact_prepush_hook') || 'false';
+  const memorableRecall = configGet('memorable_recall') || 'off';
 
   const grants: Grant[] = [
     {
@@ -188,6 +181,15 @@ function egressGrants(args: string[], home: string): number {
       file: configFile,
       key: 'redact_prepush_hook',
       revoke: 'gstack-config set redact_prepush_hook false (disables the guard)',
+    },
+    {
+      grant: 'memorable-recall',
+      value: memorableRecall,
+      granted: memorableRecall === 'on',
+      detail: 'Claude Code UserPromptSubmit hook hands each prompt to the third-party memorable CLI (receipted per prompt as sink memorable-recall; the vendor\'s own capture consent is separate)',
+      file: configFile,
+      key: 'memorable_recall',
+      revoke: 'gstack-memorable disable (or gstack-config set memorable_recall off)',
     },
   ];
 

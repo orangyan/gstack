@@ -14,7 +14,7 @@
  * from a healthy one, and the memory corpus quietly stops growing.
  *
  * Two tests here:
- *  1. Source pin (same shape as memory-ingest-no-put_page.test.ts): the flag
+ *  1. Source pin: the flag
  *     is present in active code, so removing it trips the build.
  *  2. Behavioural proof of the underlying collision, using git's own ignore
  *     machinery. No gbrain and no network required.
@@ -69,6 +69,7 @@ describe("gstack-memory-ingest: gbrain import must not be filtered by .gitignore
     try {
       const git = (args: string[], cwd: string, env?: NodeJS.ProcessEnv) =>
         execFileSync("git", args, {
+          timeout: 30_000,
           cwd,
           encoding: "utf-8",
           env: { ...process.env, ...env },
@@ -113,7 +114,7 @@ describe("gstack-memory-ingest: gbrain import must not be filtered by .gitignore
     const dir = mkdtempSync(join(tmpdir(), "gstack-ingest-gitignore-"));
     try {
       const git = (...args: string[]) =>
-        execFileSync("git", args, { cwd: dir, encoding: "utf-8" });
+        execFileSync("git", args, { timeout: 30_000, cwd: dir, encoding: "utf-8" });
       git("init", "-q", ".");
 
       const staging = join(dir, ".staging-ingest-12345-1700000000000", "learnings");

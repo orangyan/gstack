@@ -9,12 +9,12 @@ const UNINSTALL = path.join(ROOT, 'bin', 'gstack-uninstall');
 
 describe('gstack-uninstall', () => {
   test('syntax check passes', () => {
-    const result = spawnSync('bash', ['-n', UNINSTALL], { stdio: 'pipe' });
+    const result = spawnSync('bash', ['-n', UNINSTALL], { stdio: 'pipe', timeout: 30_000 });
     expect(result.status).toBe(0);
   });
 
   test('--help prints usage and exits 0', () => {
-    const result = spawnSync('bash', [UNINSTALL, '--help'], { stdio: 'pipe' });
+    const result = spawnSync('bash', [UNINSTALL, '--help'], { stdio: 'pipe', timeout: 30_000 });
     expect(result.status).toBe(0);
     const output = result.stdout.toString();
     expect(output).toContain('gstack-uninstall');
@@ -25,6 +25,7 @@ describe('gstack-uninstall', () => {
   test('unknown flag exits with error', () => {
     const result = spawnSync('bash', [UNINSTALL, '--bogus'], {
       stdio: 'pipe',
+      timeout: 30_000,
       env: { ...process.env, HOME: '/nonexistent' },
     });
     expect(result.status).toBe(1);
@@ -58,7 +59,7 @@ describe('gstack-uninstall', () => {
 
       // Create mock git repo
       fs.mkdirSync(mockGitRoot, { recursive: true });
-      spawnSync('git', ['init', '-b', 'main'], { cwd: mockGitRoot, stdio: 'pipe' });
+      spawnSync('git', ['init', '-b', 'main'], { cwd: mockGitRoot, stdio: 'pipe', timeout: 30_000 });
     });
 
     afterEach(() => {
@@ -68,6 +69,7 @@ describe('gstack-uninstall', () => {
     test('--force removes global Claude skills and state', () => {
       const result = spawnSync('bash', [UNINSTALL, '--force'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -98,6 +100,7 @@ describe('gstack-uninstall', () => {
     test('--keep-state preserves state directory', () => {
       const result = spawnSync('bash', [UNINSTALL, '--force', '--keep-state'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -129,6 +132,7 @@ describe('gstack-uninstall', () => {
           GSTACK_DIR: path.join(cleanHome, 'nonexistent'),
           GSTACK_STATE_DIR: path.join(cleanHome, '.gstack'),
         },
+        timeout: 30_000,
         cwd: mockGitRoot,
       });
 
@@ -143,6 +147,7 @@ describe('gstack-uninstall', () => {
 
       const result = spawnSync('bash', [UNINSTALL, '--force'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -180,6 +185,7 @@ describe('gstack-uninstall', () => {
 
       const result = spawnSync('bash', [UNINSTALL, '--force'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -212,6 +218,7 @@ describe('gstack-uninstall', () => {
 
       const result = spawnSync('bash', [UNINSTALL, '--force'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -251,7 +258,7 @@ describe('hook cleanup runs before the install root is deleted', () => {
       fs.mkdirSync(installBin, { recursive: true });
       // The installed copies — the uninstaller under test IS the one inside
       // the root it deletes.
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const src = path.join(ROOT, 'bin', b);
         const dst = path.join(installBin, b);
         fs.copyFileSync(src, dst);
@@ -275,6 +282,7 @@ describe('hook cleanup runs before the install root is deleted', () => {
 
       const result = spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), '--force', '--keep-state'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -301,6 +309,81 @@ describe('hook cleanup runs before the install root is deleted', () => {
   }, 30000);
 });
 
+describe('the Memorable bridge hook is removed by name and the kept config is left honest', () => {
+  test('a tag-stripped memorable entry is removed, reported, and memorable_recall is set off under --keep-state', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-memo-'));
+    try {
+      const mockHome = path.join(tmp, 'home');
+      const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
+      const installBin = path.join(installRoot, 'bin');
+      fs.mkdirSync(installBin, { recursive: true });
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
+        const dst = path.join(installBin, b);
+        fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
+        fs.chmodSync(dst, 0o755);
+      }
+      const settingsFile = path.join(mockHome, '.claude', 'settings.json');
+      fs.writeFileSync(settingsFile, JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            { hooks: [{ type: 'command', command: `${installRoot}/hosts/claude/hooks/memorable-user-prompt-hook`, timeout: 5 }] },
+            { hooks: [{ type: 'command', command: '"/Users/me/.memorable/bin/memorable" hook user-prompt' }] },
+          ],
+        },
+      }, null, 2));
+      const stateRoot = path.join(mockHome, '.gstack');
+      fs.mkdirSync(stateRoot, { recursive: true });
+      const env = { ...process.env, HOME: mockHome, GSTACK_SETTINGS_FILE: settingsFile, GSTACK_STATE_ROOT: stateRoot };
+      spawnSync('bash', [path.join(installBin, 'gstack-config'), 'set', 'memorable_recall', 'on'], { env, timeout: 20_000 });
+
+      const result = spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), '--force', '--keep-state'], {
+        stdio: 'pipe', timeout: 30_000, env, cwd: tmp, encoding: 'utf-8',
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('Memorable UserPromptSubmit hook');
+      const s = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+      // gstack's entry gone, the vendor's own entry untouched
+      expect(s.hooks.UserPromptSubmit).toHaveLength(1);
+      expect(s.hooks.UserPromptSubmit[0].hooks[0].command).toContain('.memorable/bin/memorable');
+      expect(fs.readFileSync(path.join(stateRoot, 'config.yaml'), 'utf-8')).toMatch(/memorable_recall: off/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30000);
+});
+
+describe('the Memorable arm stays quiet when nothing of its is registered', () => {
+  test('no memorable entry -> no "Memorable UserPromptSubmit hook" in the summary, exit 0', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-memo-none-'));
+    try {
+      const mockHome = path.join(tmp, 'home');
+      const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
+      const installBin = path.join(installRoot, 'bin');
+      fs.mkdirSync(installBin, { recursive: true });
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
+        const dst = path.join(installBin, b);
+        fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
+        fs.chmodSync(dst, 0o755);
+      }
+      const settingsFile = path.join(mockHome, '.claude', 'settings.json');
+      fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: '/Users/me/my-own-hook' }] }] } }, null, 2));
+      fs.mkdirSync(path.join(mockHome, '.gstack'), { recursive: true });
+      const result = spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), '--force', '--keep-state'], {
+        stdio: 'pipe', timeout: 30_000, encoding: 'utf-8', cwd: tmp,
+        env: { ...process.env, HOME: mockHome, GSTACK_SETTINGS_FILE: settingsFile, GSTACK_STATE_ROOT: path.join(mockHome, '.gstack') },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toContain('Memorable UserPromptSubmit hook');
+      const s = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+      expect(s.hooks.UserPromptSubmit[0].hooks[0].command).toBe('/Users/me/my-own-hook');
+      // the consent flip only runs when the key reads on: no config file is created just to say off
+      expect(fs.existsSync(path.join(mockHome, '.gstack', 'config.yaml'))).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30000);
+});
+
 describe('hook cleanup under lock contention is loud, never silent (review-army)', () => {
   test('a held foreign lock during uninstall surfaces the give-up warning on stderr', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-lock-'));
@@ -309,7 +392,7 @@ describe('hook cleanup under lock contention is loud, never silent (review-army)
       const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
       const installBin = path.join(installRoot, 'bin');
       fs.mkdirSync(installBin, { recursive: true });
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const dst = path.join(installBin, b);
         fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
         fs.chmodSync(dst, 0o755);
@@ -331,6 +414,7 @@ describe('hook cleanup under lock contention is loud, never silent (review-army)
 
       const result = spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), '--force', '--keep-state'], {
         stdio: 'pipe',
+        timeout: 30_000,
         env: {
           ...process.env,
           HOME: mockHome,
@@ -353,4 +437,127 @@ describe('hook cleanup under lock contention is loud, never silent (review-army)
     // and their bun -e cold starts stack up under load — the default 5s
     // per-test budget is too tight on a busy box.
   }, 30000);
+});
+
+describe('the consent key never outlives the hook, even when the config lives outside the removed state dir', () => {
+  test('full uninstall (no --keep-state) with GSTACK_STATE_ROOT elsewhere: memorable_recall flips off there', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-memo-root-'));
+    try {
+      const mockHome = path.join(tmp, 'home');
+      const otherRoot = path.join(tmp, 'elsewhere');
+      const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
+      const installBin = path.join(installRoot, 'bin');
+      fs.mkdirSync(installBin, { recursive: true });
+      fs.mkdirSync(otherRoot, { recursive: true });
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
+        const dst = path.join(installBin, b);
+        fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
+        fs.chmodSync(dst, 0o755);
+      }
+      const settingsFile = path.join(mockHome, '.claude', 'settings.json');
+      fs.writeFileSync(settingsFile, JSON.stringify({ hooks: {} }));
+      fs.mkdirSync(path.join(mockHome, '.gstack'), { recursive: true });
+      const env = { ...process.env, HOME: mockHome, GSTACK_SETTINGS_FILE: settingsFile, GSTACK_STATE_ROOT: otherRoot };
+      expect(spawnSync('bash', [path.join(installBin, 'gstack-config'), 'set', 'memorable_recall', 'on'], { env, timeout: 20_000 }).status).toBe(0);
+      const result = spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), '--force'], {
+        stdio: 'pipe', timeout: 30_000, encoding: 'utf-8', cwd: tmp, env,
+      });
+      expect(result.status).toBe(0);
+      expect(fs.existsSync(path.join(mockHome, '.gstack'))).toBe(false); // the default state dir went
+      expect(fs.readFileSync(path.join(otherRoot, 'config.yaml'), 'utf-8')).toMatch(/memorable_recall: off/); // the real config did not keep consent
+      expect(result.stdout).toContain('memorable_recall consent (set off)');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the consent flip does not depend on the hook manager being present', () => {
+  test('gstack-settings-hook missing from the install: memorable_recall still goes off', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-memo-nohook-'));
+    try {
+      const mockHome = path.join(tmp, 'home');
+      const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
+      const installBin = path.join(installRoot, 'bin');
+      fs.mkdirSync(installBin, { recursive: true });
+      for (const b of ['gstack-uninstall', 'gstack-config', 'gstack-state-root.sh']) { // no settings hook, no session-update
+        const dst = path.join(installBin, b);
+        fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
+        fs.chmodSync(dst, 0o755);
+      }
+      const stateRoot = path.join(mockHome, '.gstack');
+      fs.mkdirSync(stateRoot, { recursive: true });
+      const env = { ...process.env, HOME: mockHome, GSTACK_STATE_ROOT: stateRoot };
+      expect(spawnSync('bash', [path.join(installBin, 'gstack-config'), 'set', 'memorable_recall', 'on'], { env, timeout: 20_000 }).status).toBe(0);
+      const result = spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), '--force', '--keep-state'], {
+        stdio: 'pipe', timeout: 30_000, encoding: 'utf-8', cwd: tmp, env,
+      });
+      expect(result.status).toBe(0);
+      expect(fs.readFileSync(path.join(stateRoot, 'config.yaml'), 'utf-8')).toMatch(/memorable_recall: off/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('state-root safety: only the default root is deleted (docs/state-root.md)', () => {
+  let tmp: string, mockHome: string, installBin: string, installRoot: string;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-root-'));
+    mockHome = path.join(tmp, 'home');
+    installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
+    installBin = path.join(installRoot, 'bin');
+    fs.mkdirSync(installBin, { recursive: true });
+    for (const b of ['gstack-uninstall', 'gstack-config', 'gstack-state-root.sh']) {
+      fs.copyFileSync(path.join(ROOT, 'bin', b), path.join(installBin, b));
+      fs.chmodSync(path.join(installBin, b), 0o755);
+    }
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  function uninstall(args: string[], env: Record<string, string>, input?: string) {
+    return spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), ...args], {
+      cwd: tmp, input, encoding: 'utf-8', timeout: 30_000,
+      env: { ...process.env, HOME: mockHome, GSTACK_SETTINGS_FILE: path.join(mockHome, 'settings.json'),
+        GSTACK_HOME: '', GSTACK_STATE_ROOT: '', GSTACK_STATE_DIR: '', CLAUDE_PLUGIN_DATA: '', ...env } as Record<string, string>,
+    });
+  }
+
+  for (const mode of ['--force', 'interactive'] as const) {
+    test(`a custom GSTACK_HOME root is left in place with the removal command (${mode}); $HOME/.gstack goes`, () => {
+      const custom = path.join(tmp, 'custom-state');
+      fs.mkdirSync(path.join(custom, 'projects'), { recursive: true });
+      fs.mkdirSync(path.join(mockHome, '.gstack'), { recursive: true });
+      const r = mode === '--force' ? uninstall(['--force'], { GSTACK_HOME: custom }) : uninstall([], { GSTACK_HOME: custom }, 'y\n');
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain(`left in place: ${custom} (selected by GSTACK_HOME=${custom})`);
+      expect(r.stderr).toContain(`fix: after checking it, remove it with rm -rf -- '${custom}'`);
+      expect(r.stderr).toContain('docs/state-root.md');
+      expect(fs.existsSync(path.join(custom, 'projects'))).toBe(true);
+      expect(fs.existsSync(path.join(mockHome, '.gstack'))).toBe(false);
+      if (mode === 'interactive') expect(r.stdout).toContain(`(kept) ${custom}`);
+    });
+  }
+
+  for (const [label, target] of [['$HOME', () => mockHome], ['/', () => '/'], ['the gstack checkout', () => installRoot]] as const) {
+    test(`$HOME/.gstack symlinked to ${label} is refused with exit 2 and a fix line`, () => {
+      fs.symlinkSync(target(), path.join(mockHome, '.gstack'));
+      const r = uninstall(['--force'], {});
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain(`gstack-uninstall: refusing to delete ${path.join(mockHome, '.gstack')}: `);
+      expect(r.stderr).toMatch(/^fix: .*docs\/state-root\.md/m);
+      expect(fs.existsSync(path.join(installBin, 'gstack-uninstall'))).toBe(true);
+      expect(fs.lstatSync(path.join(mockHome, '.gstack')).isSymbolicLink()).toBe(true);
+    });
+  }
+
+  test('--keep-state deletes nothing and never refuses', () => {
+    const custom = path.join(tmp, 'custom-state');
+    fs.mkdirSync(custom, { recursive: true });
+    fs.symlinkSync(mockHome, path.join(mockHome, '.gstack'));
+    const r = uninstall(['--force', '--keep-state'], { GSTACK_HOME: custom });
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('left in place:');
+    expect(fs.existsSync(custom)).toBe(true);
+    expect(fs.lstatSync(path.join(mockHome, '.gstack')).isSymbolicLink()).toBe(true);
+  });
 });

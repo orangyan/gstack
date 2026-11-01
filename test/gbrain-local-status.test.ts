@@ -38,8 +38,10 @@ import { spawnSync } from "child_process";
 
 import {
   localEngineStatus,
+  localEngineStatusDetail,
   cacheFilePath,
   probeTimeoutMs,
+  probeGbrainBin,
   CACHE_TTL_MS,
   DEFAULT_PROBE_TIMEOUT_MS,
   type LocalEngineStatus,
@@ -62,7 +64,7 @@ interface FakeEnv {
  */
 function makeEnv(opts: {
   withGbrain?: boolean;
-  gbrainBehavior?: "ok" | "broken-db" | "broken-config" | "engine-locked" | "throws" | "slow" | "thin-refusal";
+  gbrainBehavior?: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal" | "dns-failure";
   withConfig?: boolean;
   /** #2051: config carries gbrain's remote_mcp thin-client marker. */
   thinClientConfig?: boolean;
@@ -116,8 +118,18 @@ function makeEnv(opts: {
 }
 
 function makeFakeGbrainScript(
-  behavior: "ok" | "broken-db" | "broken-config" | "engine-locked" | "throws" | "slow" | "thin-refusal",
+  behavior: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal" | "dns-failure",
 ): string {
+  // "slow-version": gbrain IS installed but even `--version` blows the
+  // (test-lowered) budget — the #2716 bun-shim-on-a-loaded-POSIX-box shape.
+  // Must classify as "timeout" (usable, --is-ok forgives), never "no-cli".
+  if (behavior === "slow-version") {
+    return `#!/bin/sh
+sleep 2
+echo "gbrain 0.43.0.0"
+exit 0
+`;
+  }
   // "slow": healthy engine on a cold pooler connection (#1964) — sleeps past
   // the (test-lowered) probe timeout, then would answer fine.
   if (behavior === "slow") {
@@ -141,6 +153,10 @@ exit 0
         ? 'echo "Error: malformed config.json at ~/.gbrain/config.json" >&2'
         : behavior === "engine-locked"
           ? 'echo "gbrain sources: connect timed out (default 10000ms; pass --timeout=Ns to override)." >&2'
+        : behavior === "engine-locked-v43"
+          ? "echo \"GBrains local database is already open through gbrain serve (MCP, PID 12345). This brain uses PGLite, so a separate CLI process cannot open it at the same time. Stop gbrain serve, then retry this CLI command.\" >&2"
+        : behavior === "dns-failure"
+          ? 'echo "Cannot connect to database: getaddrinfo ENOTFOUND db.example.com. Fix: Check your connection URL in ~/.gbrain/config.json" >&2'
         : behavior === "throws"
           ? 'echo "unexpected gbrain failure" >&2'
           : behavior === "thin-refusal"
@@ -210,6 +226,7 @@ describe("lib/gbrain-local-status — status classification", () => {
     );
 
     expect(source).not.toContain('command -v gbrain');
+    // tripwire-exempt: string assertion on lib source text, not a call
     expect(source).toContain('execFileSync("gbrain", ["--version"]');
   });
 
@@ -219,10 +236,49 @@ describe("lib/gbrain-local-status — status classification", () => {
     expect(localEngineStatus({ noCache: true })).toBe("no-cli");
   });
 
+  // #2716: a present-but-slow gbrain (bun-shim install on a loaded POSIX box)
+  // used to collapse into the same `null` as a missing binary — classified
+  // "no-cli", which `--is-ok` does NOT forgive, so every brain-aware block
+  // silently disappeared. Slow-but-present must classify "timeout" (forgiven).
+  it("returns 'timeout' (not 'no-cli') when the --version probe blows its budget", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "slow-version", withConfig: true });
+    restoreEnv = applyEnv(env);
+    process.env.GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS = "300";
+    try {
+      expect(localEngineStatus({ noCache: true })).toBe("timeout");
+    } finally {
+      delete process.env.GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS;
+    }
+  });
+
   it("returns 'missing-config' when CLI is present but ~/.gbrain/config.json absent", () => {
     env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: false });
     restoreEnv = applyEnv(env);
     expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+  });
+
+  it("classifies a DNS failure as db-unreachable with the host, never broken-db (A2, #2884)", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "dns-failure" });
+    writeFileSync(env.configPath, JSON.stringify({ database_url: ["postgresql://u", "secret@db.example.com:5432/brain"].join(":") }));
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("db-unreachable");
+    const detail = localEngineStatusDetail() ?? "";
+    expect(detail).toContain("ENOTFOUND db.example.com");
+    expect(detail).toContain("your gbrain config is unchanged");
+    expect(detail).not.toContain("secret");
+    // A cached classification keeps the reason.
+    expect(localEngineStatus()).toBe("db-unreachable");
+    expect(localEngineStatusDetail()).toBe(detail);
+  });
+
+  it("gstack-gbrain-detect --is-ok treats db-unreachable as usable, like timeout (A2)", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "dns-failure", withConfig: true });
+    const r = spawnSync(process.execPath, [join(import.meta.dir, "..", "bin", "gstack-gbrain-detect"), "--is-ok"], {
+      env: { HOME: env.home, PATH: `${env.bindir}:/usr/bin:/bin`, GSTACK_HOME: env.gstackHome, GSTACK_DETECT_NO_CACHE: "1" },
+      encoding: "utf-8",
+      timeout: 20_000,
+    });
+    expect(r.status).toBe(0);
   });
 
   it("returns 'broken-db' when sources list emits 'Cannot connect to database'", () => {
@@ -247,6 +303,19 @@ describe("lib/gbrain-local-status — status classification", () => {
     env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked", withConfig: true });
     restoreEnv = applyEnv(env);
     expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  it("returns 'engine-locked' when gbrain >= 0.43 refuses with 'already open through' and exit 1", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked-v43", withConfig: true });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  it("classifies the >= 0.43 held-lock refusal on a non-PGLite engine as broken-db", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked-v43", withConfig: true });
+    restoreEnv = applyEnv(env);
+    writeFileSync(env.configPath, JSON.stringify({ engine: "postgres", database_url: "postgres://fake" }));
+    expect(localEngineStatus({ noCache: true })).toBe("broken-db");
   });
 
   it("classifies a non-PGLite connect timeout as unreachable DB, not malformed config", () => {
@@ -358,6 +427,44 @@ describe("probeTimeoutMs — env override parsing", () => {
   it("never returns 0 for fractional sub-millisecond values (0 = NO timeout in execFileSync)", () => {
     expect(probeTimeoutMs({ GSTACK_GBRAIN_PROBE_TIMEOUT_MS: "0.5" })).toBe(1);
     expect(probeTimeoutMs({ GSTACK_GBRAIN_PROBE_TIMEOUT_MS: "0.0001" })).toBe(1);
+  });
+});
+
+describe("versionProbeTimeoutMs — invalid env overrides fall back to the default budget (behavioral via probeGbrainBin)", () => {
+  // versionProbeTimeoutMs is module-private, so pin its fallback BEHAVIOR:
+  // a fast healthy fake gbrain must probe identically whether the override
+  // env var is unset, non-numeric, or non-positive. If an invalid value ever
+  // reached execFileSync as its `timeout` (NaN / -1), the guarded call would
+  // throw into the catch and report { bin: null } — a fake "no-cli".
+  //
+  // probeGbrainBin memoizes per PATH key, so each case gets its OWN makeEnv
+  // (fresh mkdtemp bindir → unique PATH → fresh cache entry), and env is
+  // passed explicitly — no process.env mutation, no cross-case cache hits.
+  function probeWith(override?: string) {
+    const env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: true });
+    try {
+      const probeEnv: NodeJS.ProcessEnv = { PATH: `${env.bindir}:/usr/bin:/bin` };
+      if (override !== undefined) probeEnv.GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS = override;
+      return probeGbrainBin(probeEnv);
+    } finally {
+      env.cleanup();
+    }
+  }
+
+  it("unset override — the default-budget baseline resolves the bin", () => {
+    expect(probeWith()).toEqual({ bin: "gbrain", timedOut: false });
+  });
+
+  it("non-numeric override ('abc') behaves as the default-budget case (no throw, sane shape)", () => {
+    expect(probeWith("abc")).toEqual({ bin: "gbrain", timedOut: false });
+  });
+
+  it("negative override ('-1') behaves as the default-budget case (no throw, sane shape)", () => {
+    expect(probeWith("-1")).toEqual({ bin: "gbrain", timedOut: false });
+  });
+
+  it("zero override ('0') behaves as the default-budget case (0 would mean NO timeout)", () => {
+    expect(probeWith("0")).toEqual({ bin: "gbrain", timedOut: false });
   });
 });
 
@@ -538,6 +645,7 @@ describe("lib/gbrain-local-status — thin-client (#2051)", () => {
         GSTACK_HOME: env.gstackHome,
         GSTACK_DETECT_NO_CACHE: "1",
       },
+      timeout: 30_000,
     });
     expect(r.status).toBe(0);
   });
@@ -554,6 +662,7 @@ describe("lib/gbrain-local-status — thin-client (#2051)", () => {
         GSTACK_HOME: env.gstackHome,
         GSTACK_DETECT_NO_CACHE: "1",
       },
+      timeout: 30_000,
     });
     expect(r.status).toBe(1);
   });
@@ -790,6 +899,7 @@ describe("lib/gbrain-local-status — bearer-token thin-client (#2520)", () => {
         GSTACK_HOME: env.gstackHome,
         GSTACK_DETECT_NO_CACHE: "1",
       },
+      timeout: 30_000,
     });
     expect(r.status).toBe(0);
   });

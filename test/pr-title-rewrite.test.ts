@@ -5,7 +5,7 @@ import * as path from 'path';
 const HELPER = path.join(import.meta.dir, '..', 'bin', 'gstack-pr-title-rewrite.sh');
 
 function rewrite(version: string, title: string): { stdout: string; status: number; stderr: string } {
-  const r = spawnSync(HELPER, [version, title], { encoding: 'utf-8' });
+  const r = spawnSync(HELPER, [version, title], { encoding: 'utf-8', timeout: 30_000 });
   return { stdout: (r.stdout ?? '').trimEnd(), status: r.status ?? -1, stderr: r.stderr ?? '' };
 }
 
@@ -54,7 +54,7 @@ describe('gstack-pr-title-rewrite', () => {
   });
 
   test('errors on missing args', () => {
-    const r = spawnSync(HELPER, ['1.2.3.4'], { encoding: 'utf-8' });
+    const r = spawnSync(HELPER, ['1.2.3.4'], { encoding: 'utf-8', timeout: 30_000 });
     expect(r.status).not.toBe(0);
   });
 
@@ -67,5 +67,22 @@ describe('gstack-pr-title-rewrite', () => {
     const once = rewrite('1.2.3.4', 'feat: foo').stdout;
     const twice = rewrite('1.2.3.4', once).stdout;
     expect(twice).toBe(once);
+  });
+
+  test('--stdin reads the platform title from standard input, so no shell string carries it', () => {
+    const title = "feat: `id` $(touch x) it's \"quoted\"";
+    const r = spawnSync(HELPER, ['1.2.3.4', '--stdin'], { input: title + '\n', encoding: 'utf-8', timeout: 30_000 });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(`v1.2.3.4 ${title}\n`);
+    const again = spawnSync(HELPER, ['1.2.3.4', '--stdin'], { input: 'v1.2.3 fix: y', encoding: 'utf-8', timeout: 30_000 });
+    expect(again.stdout).toBe('v1.2.3.4 fix: y\n');
+  });
+
+  test('--stdin refuses an empty or multi-line title', () => {
+    for (const input of ['', 'a\nb\n']) {
+      const r = spawnSync(HELPER, ['1.2.3.4', '--stdin'], { input, encoding: 'utf-8', timeout: 30_000 });
+      expect(r.status).toBe(2);
+      expect(r.stdout).toBe('');
+    }
   });
 });

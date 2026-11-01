@@ -1,7 +1,9 @@
 /**
  * redact-engine — pure scanning + auto-redaction over the shared taxonomy.
  *
- * No I/O. Deterministic. The CLI shim (`bin/gstack-redact`), the pre-push hook
+ * No I/O. Deterministic given its one ambient input: `scan()` reads the
+ * credential-named variables of `process.env` by value unless `processEnv` is
+ * passed (GSTA-104). The CLI shim (`bin/gstack-redact`), the pre-push hook
  * (`bin/gstack-redact-prepush`), and tests all import from here.
  *
  * Key behaviors (locked in /plan-eng-review + two Codex passes):
@@ -24,6 +26,7 @@
 import {
   PATTERNS,
   PATTERNS_BY_ID,
+  clearStringSpanCache,
   isPlaceholderSpan,
   type RedactPattern,
   type Tier,
@@ -69,6 +72,23 @@ export interface ScanOptions {
   repoPublicEmails?: string[];
   /** Hard byte cap. Oversize input fails CLOSED. Default 1 MiB. */
   maxBytes?: number;
+  /**
+   * Path of the file the input came from, when known (the pre-push hook's
+   * `+++ b/` path, `--from-file`). Lets a pattern tell source syntax from a
+   * literal: in a TypeScript/JSX file `session: SessionState,` is a type.
+   */
+  sourcePath?: string;
+  /**
+   * The environment whose credential-named variables (a name whose last
+   * `_`-separated word is KEY, TOKEN, SECRET, PASSWORD, PASSWD, PASS, PAT or
+   * APIKEY, or that ends in _PWD, any case, carrying no PUBLIC word; see
+   * `credentialEnvValues`) are scanned for BY VALUE: wherever one of those
+   * values appears in the text it is an `env.value` HIGH finding, whatever its
+   * shape, so a value that reached the text (a dumped environment in a tool
+   * output, GSTA-96) never reaches a PR body, receipt, report or Drive file.
+   * Defaults to `process.env`; pass `{}` to scan without one.
+   */
+  processEnv?: Record<string, string | undefined>;
 }
 
 export interface ScanResult {
@@ -83,6 +103,17 @@ const DEFAULT_MAX_BYTES = 1024 * 1024; // 1 MiB
 
 const EMAIL_ALLOW_DOMAINS = [/@example\.(com|org|net)$/i, /@example\.[a-z]{2,}$/i];
 const EMAIL_ALLOW_LOCALPARTS = [/^noreply@/i, /^no-reply@/i, /^donotreply@/i];
+/**
+ * Hosts whose `git@<host>` is a git transport endpoint, never a person's
+ * mailbox. Matched EXACTLY — a domain that merely starts with "git"
+ * (gitmail.com) is a normal domain and must keep firing.
+ */
+const SSH_GIT_HOSTS = new Set([
+  "github.com",
+  "gitlab.com",
+  "bitbucket.org",
+  "ssh.dev.azure.com",
+]);
 
 // ── Normalization ─────────────────────────────────────────────────────────────
 
@@ -110,6 +141,10 @@ export function normalizeWithMap(input: string): {
   normalized: string;
   map: number[];
 } {
+  return normalizeOriginal(input);
+}
+
+function normalizeOriginal(input: string, spanEnds?: number[]): { normalized: string; map: number[] } {
   const out: string[] = [];
   const map: number[] = [];
   let i = 0;
@@ -122,6 +157,7 @@ export function normalizeWithMap(input: string): {
         for (const ch of rep) {
           out.push(ch);
           map.push(i);
+          spanEnds?.push(i + ent.length);
         }
         i += ent.length;
         matchedEntity = true;
@@ -139,9 +175,10 @@ export function normalizeWithMap(input: string): {
     ZERO_WIDTH.lastIndex = 0;
 
     const norm = ch.normalize("NFKC");
-    for (const nch of norm) {
-      out.push(nch);
+    for (let j = 0; j < norm.length; j++) {
+      out.push(norm[j]);
       map.push(i);
+      spanEnds?.push(i + 1);
     }
     i += 1;
   }
@@ -152,18 +189,28 @@ export function normalizeWithMap(input: string): {
 
 // ── Offset → line/col on the ORIGINAL text ────────────────────────────────────
 
-function lineColAt(original: string, offset: number): { line: number; col: number } {
-  let line = 1;
-  let col = 1;
-  for (let i = 0; i < offset && i < original.length; i++) {
-    if (original[i] === "\n") {
-      line += 1;
-      col = 1;
-    } else {
-      col += 1;
-    }
+/** Start offset of every line, built once per scan and only when a finding needs it. */
+function lineStarts(original: string): number[] {
+  const starts = [0];
+  for (let i = 0; i < original.length; i++) if (original[i] === "\n") starts.push(i + 1);
+  return starts;
+}
+
+/**
+ * Binary search over lineStarts: O(log lines) per finding. The previous walk
+ * from offset 0 per finding made a match-dense input (a pasted log full of
+ * emails and IPs) cost O(findings x bytes) — seconds for a few hundred KiB.
+ */
+function lineColAt(starts: number[], original: string, offset: number): { line: number; col: number } {
+  const at = Math.min(Math.max(0, offset), original.length);
+  let lo = 0;
+  let hi = starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (starts[mid] <= at) lo = mid;
+    else hi = mid - 1;
   }
-  return { line, col };
+  return { line: lo + 1, col: at - starts[lo] + 1 };
 }
 
 // ── Safe preview masking ──────────────────────────────────────────────────────
@@ -240,19 +287,80 @@ function hasNear(
 
 // ── Email allowlist ───────────────────────────────────────────────────────────
 
-function emailAllowed(email: string, opts: ScanOptions): boolean {
+/**
+ * True when the matched "email" is really the user@host of a git SSH remote.
+ *
+ * `pii.email` matches the `git@github.com` inside
+ * `git@github.com:org/repo.git` — a transport identity, not PII. This keys on
+ * the surrounding URL SHAPE, not on the `git` local part: allowlisting `git@`
+ * outright would also suppress a genuine address at a domain that merely
+ * begins with "git" (e.g. git@gitmail.com), turning a false positive into a
+ * false negative.
+ *
+ * Two accepted shapes:
+ *   - scp-like `<user>@<host>:<path>` where the path ends in `.git`, for any
+ *     host — this covers self-hosted remotes.
+ *   - `git@<known-host>` for the major forges, whose bare form appears in docs
+ *     and in `ssh -T git@github.com` connectivity checks with no path at all.
+ */
+/** Lookahead window for the scp-path suffix check — long enough for any real
+ *  remote path, bounded so a pathological unbroken line can't grow the scan. */
+const SSH_REMOTE_PATH_LOOKAHEAD_CHARS = 512;
+
+function isSshGitRemote(email: string, text: string, spanStart: number): boolean {
+  const at = email.lastIndexOf("@");
+  if (at < 0) return false;
+  const local = email.slice(0, at).toLowerCase();
+  const host = email.slice(at + 1).toLowerCase();
+
+  // Major forges: `git@host`, with or without a trailing path.
+  if (local === "git" && SSH_GIT_HOSTS.has(host)) return true;
+
+  // Any host in `<user>@<host>:<path>.git` position. The path stops at
+  // whitespace or a quote so a trailing delimiter never defeats the suffix.
+  const rest = text.slice(
+    spanStart + email.length,
+    spanStart + email.length + SSH_REMOTE_PATH_LOOKAHEAD_CHARS,
+  );
+  const scp = /^:(?!\/)([^\s'"`<>]*)/.exec(rest);
+  if (scp && /\.git\/?$/.test(scp[1])) return true;
+
+  // ssh:// URL form: ssh://<user>@<host>/<path>.git
+  const before = text.slice(Math.max(0, spanStart - 16), spanStart);
+  if (/(?:git\+)?ssh:\/\/$/i.test(before)) {
+    const slash = /^\/([^\s'"`<>]*)/.exec(rest);
+    if (slash && /\.git\/?$/.test(slash[1])) return true;
+  }
+
+  return false;
+}
+
+function emailAllowed(
+  email: string,
+  opts: ScanOptions,
+  text: string,
+  spanStart: number,
+): boolean {
   const lower = email.toLowerCase();
   if (opts.selfEmail && lower === opts.selfEmail.toLowerCase()) return true;
   if (opts.repoPublicEmails?.some((e) => e.toLowerCase() === lower)) return true;
   if (EMAIL_ALLOW_DOMAINS.some((re) => re.test(email))) return true;
   if (EMAIL_ALLOW_LOCALPARTS.some((re) => re.test(email))) return true;
+  if (isSshGitRemote(email, text, spanStart)) return true;
   return false;
 }
 
 // ── The scan ──────────────────────────────────────────────────────────────────
 
 export function scan(input: string, opts: ScanOptions = {}): ScanResult {
+  return scanInternal(input, opts);
+}
+
+type OriginalSpan = { start: number; end: number };
+
+function scanInternal(input: string, opts: ScanOptions, spans?: Map<Finding, OriginalSpan>): ScanResult {
   const repoVisibility: RepoVisibility = opts.repoVisibility ?? "unknown";
+  let starts: number[] | null = null; // line index, built on the first finding
   // #1824: ?? only catches null/undefined, not NaN or <= 0. A bad value
   // (NaN from a malformed --max-bytes, or a negative) would make `byteLen >
   // maxBytes` always false and silently disable the fail-closed oversize guard.
@@ -287,7 +395,8 @@ export function scan(input: string, opts: ScanOptions = {}): ScanResult {
     };
   }
 
-  const { normalized, map } = normalizeWithMap(input);
+  const spanEnds: number[] | undefined = spans ? [] : undefined;
+  const { normalized, map } = normalizeOriginal(input, spanEnds);
   const fenceRanges = toolFenceRanges(normalized);
   const allow = new Set(opts.allowlist ?? []);
 
@@ -303,15 +412,14 @@ export function scan(input: string, opts: ScanOptions = {}): ScanResult {
       if (m.index === re.lastIndex) re.lastIndex++;
 
       const span = m[1] ?? m[0];
-      const spanStartInMatch = m[1] !== undefined ? m[0].indexOf(m[1]) : 0;
-      const normOffset = m.index + Math.max(0, spanStartInMatch);
+      const normOffset = m.indices?.[1]?.[0] ?? m.index;
 
       // Per-span placeholder suppression.
       if (isPlaceholderSpan(span)) continue;
       if (allow.has(span)) continue;
 
       // Pattern-specific validators (Luhn, entropy, RFC1918, etc).
-      if (pat.validate && !pat.validate(span, m)) continue;
+      if (pat.validate && !pat.validate(span, m, opts)) continue;
 
       // Proximity requirement.
       if (
@@ -322,14 +430,16 @@ export function scan(input: string, opts: ScanOptions = {}): ScanResult {
       }
 
       // Email allowlist (layered on top of the pattern).
-      if (pat.id === "pii.email" && emailAllowed(span, opts)) continue;
+      if (pat.id === "pii.email" && emailAllowed(span, opts, normalized, normOffset))
+        continue;
 
       const origOffset = map[Math.min(normOffset, map.length - 1)] ?? 0;
       const key = `${pat.id}:${origOffset}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
-      const { line, col } = lineColAt(input, origOffset);
+      starts ??= lineStarts(input);
+      const { line, col } = lineColAt(starts, input, origOffset);
 
       // Tool-fence degrade: only credential-category, only obvious doc examples.
       let severity: Severity = pat.tier;
@@ -343,7 +453,7 @@ export function scan(input: string, opts: ScanOptions = {}): ScanResult {
         toolFenceDegraded = true;
       }
 
-      findings.push({
+      const finding: Finding = {
         id: pat.id,
         tier: pat.tier,
         severity,
@@ -355,7 +465,53 @@ export function scan(input: string, opts: ScanOptions = {}): ScanResult {
         autoRedactable: !!pat.autoRedactable,
         repoVisibility,
         ...(toolFenceDegraded ? { toolFenceDegraded } : {}),
-      });
+      };
+      findings.push(finding);
+      if (spans) {
+        const end = spanEnds?.[normOffset + span.length - 1];
+        if (end !== undefined && end > origOffset) spans.set(finding, { start: origOffset, end });
+      }
+    }
+  }
+  clearStringSpanCache();
+
+  // Environment values, by exact value: a credential that is already in the
+  // process environment needs no shape to be recognized.
+  for (const { name, value: raw } of credentialEnvValues(opts.processEnv ?? process.env)) {
+    // The text was normalized before matching; the value takes the same form,
+    // and the allowlist and placeholder rules see both forms.
+    const value = normalizeOriginal(raw).normalized;
+    if (allow.has(raw) || allow.has(value) || value.length < MIN_ENV_VALUE_LENGTH || isPlaceholderSpan(value)) continue;
+    let from = 0;
+    let normOffset: number;
+    while ((normOffset = normalized.indexOf(value, from)) !== -1) {
+      from = normOffset + value.length;
+      const origOffset = map[Math.min(normOffset, map.length - 1)] ?? 0;
+      // Keyed on the span, not the offset alone: when one credential's value is
+      // a prefix of another's, both findings exist and their spans coalesce.
+      const key = `env.value:${origOffset}:${value.length}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      starts ??= lineStarts(input);
+      const { line, col } = lineColAt(starts, input, origOffset);
+      const finding: Finding = {
+        id: "env.value",
+        tier: "HIGH",
+        severity: "HIGH",
+        category: "secret",
+        description: `Value of the ${name} environment variable`,
+        line,
+        col,
+        // A live credential: the name already says what leaked; show no bytes.
+        preview: "********",
+        autoRedactable: false,
+        repoVisibility,
+      };
+      findings.push(finding);
+      if (spans) {
+        const end = spanEnds?.[normOffset + value.length - 1];
+        if (end !== undefined && end > origOffset) spans.set(finding, { start: origOffset, end });
+      }
     }
   }
 
@@ -368,10 +524,46 @@ export function scan(input: string, opts: ScanOptions = {}): ScanResult {
   return { findings, counts, repoVisibility, oversize: false };
 }
 
+const CREDENTIAL_ENV_NAME = /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PAT|APIKEY)$|_PWD$/i;
+/** Framework-public keys (NEXT_PUBLIC_*_KEY, VITE_PUBLIC_*, *_PUBLIC_KEY) are committed on purpose. */
+const PUBLIC_ENV_NAME = /(^|_)PUBLIC(_|$)/i;
+/** gstack's own credential-named variables whose values are not secrets (bin/gstack-brain-lock.sh sets the lock token). */
+export const NON_SECRET_ENV_NAMES: ReadonlySet<string> = new Set(["GSTACK_BRAIN_LOCK_TOKEN"]);
+const MIN_ENV_VALUE_LENGTH = 8;
+
+/**
+ * The (name, value) pairs of `env` worth scanning for by value: credential-named
+ * variables (the last `_`-separated word is KEY, TOKEN, SECRET, PASSWORD, PASSWD,
+ * PASS, PAT or APIKEY, or the name ends in _PWD; names carrying a PUBLIC word and
+ * gstack's own non-secret tokens are exempt) whose trimmed value is long enough to
+ * be a credential and is not a placeholder. A short or placeholder value would
+ * match ordinary prose. There is no path exemption on purpose: a shape rule
+ * exempted base64 secrets that start with `/`, and an existence check let the
+ * scanned agent exempt a value by creating a path of that name; a path-valued
+ * SSL_KEY that must appear in a text goes through `allowlist` where a caller
+ * passes one (`gstack-redact`, the pre-push hook), else the variable is set
+ * empty for that one command. The value is
+ * trimmed, so a key read from a file with a trailing newline still matches its
+ * leaked form; it is matched against the normalized text in its own normalized
+ * form, so a value NFKC rewrites still finds its leaked bytes.
+ */
+export function credentialEnvValues(env: Record<string, string | undefined>): Array<{ name: string; value: string }> {
+  const out: Array<{ name: string; value: string }> = [];
+  for (const [name, raw] of Object.entries(env)) {
+    if (!CREDENTIAL_ENV_NAME.test(name) || PUBLIC_ENV_NAME.test(name) || NON_SECRET_ENV_NAMES.has(name)) continue;
+    const value = raw?.trim() ?? "";
+    if (value.length < MIN_ENV_VALUE_LENGTH) continue;
+    if (isPlaceholderSpan(value)) continue;
+    out.push({ name, value });
+  }
+  return out;
+}
+
 function withFlags(flags: string): string {
   let f = flags;
   if (!f.includes("g")) f += "g";
   if (!f.includes("m")) f += "m";
+  if (!f.includes("d")) f += "d";
   return f;
 }
 
@@ -397,10 +589,11 @@ export function applyRedactions(
   opts: ScanOptions = {},
 ): RedactResult {
   const ids = new Set(findingIds);
-  const { findings } = scan(input, opts);
+  const spans = new Map<Finding, OriginalSpan>();
+  const { findings } = scanInternal(input, opts, spans);
   const targets = findings
     .filter((f) => ids.has(f.id) && f.autoRedactable)
-    .map((f) => ({ f, ...locateSpan(input, f) }))
+    .map((f) => ({ f, ...(spans.get(f) ?? { start: -1, end: -1 }) }))
     .filter((t) => t.start >= 0);
 
   // Right-to-left so earlier offsets remain valid after splicing.
@@ -450,9 +643,80 @@ const MARKER_ONLY_PATTERN_IDS = new Set(["pem.private_key", "gcp.service_account
  * structure-preserving path.)
  */
 export function redactFindingSpans(input: string, opts: ScanOptions = {}): string | null {
-  const { findings } = scan(input, opts);
+  const merged = mergedFindingSpans(input, opts);
+  return merged && spliceEdits(input, merged.map((m) => ({ start: m.start, end: m.end, text: marker(m.ids) })));
+}
+
+/** One replacement on the original text: [start, end) becomes `text`. */
+export interface RedactionEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/**
+ * redactFindingSpans for a stream declared as JSON (a scanner report: one
+ * document, several top-level values, or NDJSON), keeping it parseable. A span
+ * inside a string keeps the in-string marker, widened to whole escape
+ * sequences; a span inside a number replaces that whole number token with the
+ * quoted marker, so `{"max_memory_bytes":1145427776}` stays valid JSON
+ * (#3185). A span that touches more than one token, a structural character,
+ * whitespace, a literal or a string's quotes returns null (withhold). A
+ * stream that does not tokenize as JSON gets the plain splice. Returns the
+ * edits (sorted, disjoint, on the original offsets) so a caller can map
+ * interleaved runs onto the result.
+ */
+export function redactJsonFindingSpans(input: string, opts: ScanOptions = {}): { body: string; edits: RedactionEdit[] } | null {
+  const merged = mergedFindingSpans(input, opts);
+  if (!merged) return null;
+  const tokens = jsonTokens(input);
+  const spans: Array<{ start: number; end: number; ids: string[]; quote: boolean }> = [];
+  for (const m of merged) {
+    if (!tokens) {
+      spans.push({ ...m, quote: false });
+      continue;
+    }
+    let lo = 0, hi = tokens.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (tokens[mid].end <= m.start) lo = mid + 1; else hi = mid;
+    }
+    const t = tokens[lo];
+    if (!t || t.start > m.start || t.end < m.end) return null;
+    let span: { start: number; end: number; quote: boolean };
+    if (t.kind === "number") span = { start: t.start, end: t.end, quote: true };
+    else if (t.kind === "string" && m.start > t.start && m.end < t.end) {
+      span = { start: m.start, end: m.end, quote: false };
+      for (const [s, e] of t.escapes) {
+        if (s < span.start && span.start < e) span.start = s;
+        if (s < span.end && span.end < e) span.end = e;
+      }
+    } else return null;
+    const last = spans[spans.length - 1];
+    if (last && span.start < last.end) {
+      last.end = Math.max(last.end, span.end);
+      for (const id of m.ids) if (!last.ids.includes(id)) last.ids.push(id);
+    } else spans.push({ ...span, ids: [...m.ids] });
+  }
+  const edits = spans.map((x) => ({ start: x.start, end: x.end, text: x.quote ? `"${marker(x.ids)}"` : marker(x.ids) }));
+  return { body: spliceEdits(input, edits), edits };
+}
+
+const marker = (ids: string[]) => `<REDACTED-${ids.join("+")}>`;
+
+function spliceEdits(input: string, edits: RedactionEdit[]): string {
+  // Right-to-left so earlier offsets remain valid after splicing.
+  let body = input;
+  for (let i = edits.length - 1; i >= 0; i--) body = body.slice(0, edits[i].start) + edits[i].text + body.slice(edits[i].end);
+  return body;
+}
+
+/** Every finding's span, coalesced; null when one cannot be located or is marker-only. */
+function mergedFindingSpans(input: string, opts: ScanOptions): Array<{ start: number; end: number; ids: string[] }> | null {
+  const spans = new Map<Finding, OriginalSpan>();
+  const { findings } = scanInternal(input, opts, spans);
   if (findings.some((f) => MARKER_ONLY_PATTERN_IDS.has(f.id))) return null;
-  const targets = findings.map((f) => ({ f, ...locateSpan(input, f) }));
+  const targets = findings.map((f) => ({ f, ...(spans.get(f) ?? { start: -1, end: -1 }) }));
   if (targets.some((t) => t.start < 0)) return null;
 
   // Coalesce overlapping/touching ranges — splicing two intersecting spans
@@ -469,34 +733,49 @@ export function redactFindingSpans(input: string, opts: ScanOptions = {}): strin
       merged.push({ start: t.start, end: t.end, ids: [t.f.id] });
     }
   }
-
-  // Right-to-left so earlier offsets remain valid after splicing.
-  let body = input;
-  for (let i = merged.length - 1; i >= 0; i--) {
-    const m = merged[i];
-    body = body.slice(0, m.start) + `<REDACTED-${m.ids.join("+")}>` + body.slice(m.end);
-  }
-  return body;
+  return merged;
 }
 
-function locateSpan(input: string, f: Finding): { start: number; end: number } {
-  // Re-derive the offset from line/col on the original text.
-  let offset = 0;
-  let line = 1;
-  while (line < f.line && offset < input.length) {
-    if (input[offset] === "\n") line++;
-    offset++;
+type JsonToken = { kind: "string" | "number" | "other"; start: number; end: number; escapes: Array<[number, number]> };
+const JSON_NUMBER = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+const JSON_LITERAL = /true|false|null/y;
+
+/** Lexical JSON tokens of one or more top-level values (NDJSON included); null when the text is not JSON. */
+function jsonTokens(text: string): JsonToken[] | null {
+  const tokens: JsonToken[] = [];
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") { i++; continue; }
+    if ("{}[]:,".includes(c)) { tokens.push({ kind: "other", start: i, end: i + 1, escapes: [] }); i++; continue; }
+    if (c === '"') {
+      const escapes: Array<[number, number]> = [];
+      let j = i + 1;
+      for (;;) {
+        if (j >= text.length) return null;
+        if (text[j] === '"') break;
+        if (text[j] === "\\") {
+          const end = j + (text[j + 1] === "u" ? 6 : 2);
+          if (end > text.length) return null;
+          escapes.push([j, end]);
+          j = end;
+        } else j++;
+      }
+      tokens.push({ kind: "string", start: i, end: j + 1, escapes });
+      i = j + 1;
+      continue;
+    }
+    let matched = false;
+    for (const [kind, pattern] of [["number", JSON_NUMBER], ["other", JSON_LITERAL]] as const) {
+      pattern.lastIndex = i;
+      if (!pattern.test(text)) continue;
+      tokens.push({ kind, start: i, end: pattern.lastIndex, escapes: [] });
+      i = pattern.lastIndex;
+      matched = true;
+      break;
+    }
+    if (!matched) return null;
   }
-  offset += f.col - 1;
-  const pat = PATTERNS_BY_ID[f.id];
-  if (!pat) return { start: -1, end: -1 };
-  const re = new RegExp(pat.regex.source, withFlags(pat.regex.flags));
-  re.lastIndex = Math.max(0, offset - 2);
-  const m = re.exec(input);
-  if (!m) return { start: -1, end: -1 };
-  const span = m[1] ?? m[0];
-  const start = m.index + (m[1] !== undefined ? m[0].indexOf(m[1]) : 0);
-  return { start, end: start + span.length };
+  return tokens;
 }
 
 function inStructuralToken(body: string, start: number, end: number): boolean {

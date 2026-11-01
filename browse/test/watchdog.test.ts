@@ -27,8 +27,10 @@ import { resolveConfig } from '../src/config';
 // seam as idleCheckTick) and tunnelActive is simulated via setTunnelActive.
 //
 // Each test spawns the real server.ts. Tests 1 and 2 verify behavior via
-// stdout log line (fast). Test 3 waits for the watchdog poll cycle to confirm
-// the server REMAINS alive after parent death (slow — ~20s observation window).
+// stdout log line (fast). Test 3 shrinks the poll cadence via
+// BROWSE_PARENT_WATCHDOG_INTERVAL_MS (test seam in server.ts), waits for the
+// tick's one-time "parent exited (server stays alive" log to prove a tick
+// observed the death, then confirms the server REMAINS alive.
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const SERVER_SCRIPT = path.join(ROOT, 'src', 'server.ts');
@@ -41,20 +43,29 @@ afterEach(async () => {
   // Kill any survivors so subsequent tests get a clean slate.
   try { parentProc?.kill('SIGKILL'); } catch {}
   try { serverProc?.kill('SIGKILL'); } catch {}
-  // Give processes a moment to exit before tmpDir cleanup.
-  await Bun.sleep(100);
+  await Promise.all([parentProc?.exited, serverProc?.exited]);
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   parentProc = null;
   serverProc = null;
 });
 
-function spawnServer(env: Record<string, string>, port: number): Subprocess {
+function spawnServer(env: Record<string, string>): Subprocess {
   const stateFile = path.join(tmpDir, 'browse-state.json');
+  const home = path.join(tmpDir, 'home');
+  fs.mkdirSync(home, { recursive: true });
   return spawn(['bun', 'run', SERVER_SCRIPT], {
     env: {
       ...process.env,
+      // The headed server writes ~/.gstack/.auth.json for its extension.
+      HOME: home,
+      USERPROFILE: home,
+      GSTACK_HOME: path.join(home, '.gstack'),
+      PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || path.join(
+        process.env.XDG_CACHE_HOME || path.join(os.homedir(), process.platform === 'darwin' ? 'Library/Caches' : '.cache'),
+        'ms-playwright',
+      ),
       BROWSE_STATE_FILE: stateFile,
-      BROWSE_PORT: String(port),
+      BROWSE_PORT: '0', // Use the existing available-port allocator; fixed ports can collide across shards.
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -99,7 +110,7 @@ async function readStdoutUntil(
 describe('parent-process watchdog (v0.18.1.0)', () => {
   test('BROWSE_PARENT_PID=0 disables the watchdog', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-pid0-'));
-    serverProc = spawnServer({ BROWSE_PARENT_PID: '0' }, 34901);
+    serverProc = spawnServer({ BROWSE_PARENT_PID: '0' });
 
     const out = await readStdoutUntil(
       serverProc,
@@ -119,7 +130,6 @@ describe('parent-process watchdog (v0.18.1.0)', () => {
     // this PID and eventually fire on the "dead parent."
     serverProc = spawnServer(
       { BROWSE_HEADED: '1', BROWSE_PARENT_PID: '999999' },
-      34902,
     );
 
     const out = await readStdoutUntil(
@@ -139,21 +149,37 @@ describe('parent-process watchdog (v0.18.1.0)', () => {
     const parentPid = parentProc.pid!;
 
     // Default headless: no BROWSE_HEADED, real parent PID — watchdog active.
-    serverProc = spawnServer({ BROWSE_PARENT_PID: String(parentPid) }, 34903);
+    // The poll cadence is shrunk via the server's env seam (250ms instead of
+    // the production 15s) so observing a real tick doesn't cost a 20s sleep.
+    serverProc = spawnServer({
+      BROWSE_PARENT_PID: String(parentPid),
+      BROWSE_PARENT_WATCHDOG_INTERVAL_MS: '250',
+    });
     const serverPid = serverProc.pid!;
 
-    // Give the server a moment to start and register the watchdog interval.
-    await Bun.sleep(2000);
+    // Startup barrier: poll stdout for the listen line instead of a fixed 2s
+    // sleep. The watchdog interval is registered at module load, before this
+    // line prints, so once we see it the ticks are running.
+    const bootOut = await readStdoutUntil(serverProc, 'Server running on', 15_000);
+    expect(bootOut).toContain('Server running on');
     expect(isProcessAlive(serverPid)).toBe(true);
 
-    // Kill the parent. The watchdog polls every 15s, so first tick after
-    // parent death lands within ~15s. Pre-#994 the server would shutdown
-    // here. Post-#994 the server logs the parent exit and stays alive.
+    // Kill the parent, then wait for a tick to OBSERVE the death: the
+    // stay-alive branch logs a one-time latched line. Seeing it proves a tick
+    // ran after parent death and chose NOT to shut down — pre-#994 the same
+    // tick called shutdown instead. (Await exited first so the PID is reaped
+    // and the tick's kill(pid, 0) probe sees ESRCH, not a zombie.)
     parentProc.kill('SIGKILL');
+    await parentProc.exited;
+    const marker = `Parent process ${parentPid} exited (server stays alive`;
+    const out = await readStdoutUntil(serverProc, marker, 15_000);
+    expect(out).toContain(marker);
+    expect(out).not.toContain('shutting down');
 
-    // Wait long enough for at least one watchdog tick (15s) plus margin.
-    // Server should still be alive — that's the whole point of #994.
-    await Bun.sleep(20_000);
+    // Let several more ticks land (4+ at 250ms — the old fixed 20s sleep
+    // covered ~1 production tick) and confirm the server is still alive —
+    // that's the whole point of #994.
+    await Bun.sleep(1_000);
     expect(isProcessAlive(serverPid)).toBe(true);
   }, 45_000);
 });
@@ -192,12 +218,12 @@ describe('headed parent-death shutdown is suppressed on runtime promotion', () =
 
   test('the server binds that callback to the suppress-flag setter', () => {
     const src = read('src/server.ts');
-    expect(src).toContain('function suppressHeadedParentShutdown()');
+    expect(src).toContain('function suppressHeadedParentShutdown(');
     // Bound on BOTH the module-level manager and any embedder-supplied one; the
     // watchdog reads activeBrowserManager, so binding only the default instance
     // leaves embedders (e.g. gbrowser) promoting silently.
     expect(src).toContain('browserManager.onHeadedPromotion = suppressHeadedParentShutdown');
-    expect(src).toContain('cfgBrowserManager.onHeadedPromotion = suppressHeadedParentShutdown');
+    expect(src).toContain('cfgBrowserManager.onHeadedPromotion = () => suppressHeadedParentShutdown(cfg.config, cfgBrowserManager)');
   });
 
   test('promotion must NOT clear the interval — the tick doubles as the tunnel-orphan reaper', () => {
@@ -299,7 +325,13 @@ describe('suppressed watchdog still reaps tunnel orphans (behavioral)', () => {
   });
 
   test('CRITICAL: suppression active + tunnel live — parent death still shuts down', async () => {
-    const exitMock = mock((_code?: number) => {});
+    let resolveExit!: () => void;
+    let exitDeadline!: ReturnType<typeof setTimeout>;
+    const exited = new Promise<void>((resolve, reject) => {
+      resolveExit = resolve;
+      exitDeadline = setTimeout(() => reject(new Error('Watchdog shutdown did not exit within 3s')), 3_000);
+    });
+    const exitMock = mock((_code?: number) => { resolveExit(); });
     const originalExit = process.exit;
     (process as any).exit = exitMock;
     try {
@@ -307,12 +339,13 @@ describe('suppressed watchdog still reaps tunnel orphans (behavioral)', () => {
       __testInternals__.suppressHeadedParentShutdown();
       __testInternals__.setTunnelActive(true); // handoff → resume → /pair-agent tunnel
       __testInternals__.parentWatchdogTick(DEAD_PID);
-      await drainShutdown();
+      await exited;
       // The tick is the ONLY reaper for tunnel orphans (idle timeout is
       // disabled in tunnel mode). If this fails, an internet-exposed daemon
       // outlives its parent forever.
       expect(exitMock).toHaveBeenCalled();
     } finally {
+      clearTimeout(exitDeadline);
       (process as any).exit = originalExit;
     }
   });

@@ -21,6 +21,7 @@
  * Periodic tier (Codex non-determinism, ~$2-3/run).
  */
 import { describe, test, expect } from 'bun:test';
+import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import * as path from 'node:path';
 import { e2eTierEnabled } from './helpers/e2e-gate';
 import { runCodexSkill } from './helpers/codex-session-runner';
@@ -30,7 +31,7 @@ const ROOT = path.resolve(import.meta.dir, '..');
 
 const CODEX_AVAILABLE = (() => {
   try {
-    return Bun.spawnSync(['which', 'codex']).exitCode === 0;
+    return Bun.spawnSync(['which', 'codex'], { timeout: 30_000 }).exitCode === 0;
   } catch {
     return false;
   }
@@ -69,13 +70,12 @@ describeCodex('/codex recommendation substance (live, periodic)', () => {
         skillDir: path.join(ROOT, 'codex'),
         skillName: 'codex',
         prompt: FIXTURE_DIFF,
-        timeoutMs: 300_000,
+        timeoutMs: CAPTURE_MS,
       });
 
-      if (result.output.startsWith('SKIP:')) {
-        // codex binary missing — describeCodex already guards, but double-safe.
-        return;
-      }
+      // Prerequisite skips happen before this test starts. An attempted run
+      // must finish successfully before its output is sent to the paid judge.
+      expect(result.exitCode, result.stderr || result.output).toBe(0);
 
       const score = await judgeRecommendation(result.output);
       // eslint-disable-next-line no-console
@@ -98,6 +98,6 @@ describeCodex('/codex recommendation substance (live, periodic)', () => {
         );
       }
     },
-    360_000,
+    CAPTURE_LONG_MS,
   );
 });

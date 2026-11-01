@@ -99,8 +99,10 @@ export interface TemplateContext {
    * - 'default': full preamble prose ships as today (writing style, completeness,
    *   confusion protocol, context health are all present).
    * - 'terse': writing-style + completeness + confusion-protocol + context-health
-   *   sections are compressed to a one-line pointer at gen time. Saves ~3-5 KB
-   *   per tier-2+ skill. Opt-in via `--explain-level=terse` build flag for
+   *   sections are compressed to a one-line pointer at gen time. Saves ~2.6 KB
+   *   per tier-2+ skill (measured 2,611 B on the v1.71 render — re-measure with
+   *   a terse vs default build diff if the preamble changes shape again).
+   *   Opt-in via `--explain-level=terse` build flag for
    *   users who want shipped skills to match their runtime preference and
    *   avoid the per-session terse-mode prose.
    *
@@ -109,6 +111,35 @@ export interface TemplateContext {
    * Terse builds make the compression structural — bytes never ship in the first place.
    */
   explainLevel?: 'default' | 'terse';
+  /**
+   * Install-context render contract (docs/ADDING_A_HOST.md): absolute install
+   * root a per-install render serves (`gen-skill-docs --install-root`).
+   * null/undefined = the host's default root (committed render, unchanged bytes).
+   */
+  installRoot?: string | null;
+  /**
+   * Plan-mode preamble block. Defaults to true (block ships).
+   * false (opt-in via `--plan-mode=off`): the "## Plan Mode Safe Operations" +
+   * "## Skill Invocation During Plan Mode" section is dropped from the
+   * preamble. "PLAN MODE EXCEPTION — ALWAYS RUN" markers inside skill bodies
+   * still apply.
+   */
+  planMode?: boolean;
+  /**
+   * Module loadout filter (modules/loadouts.json, gen-skill-docs --loadout/--modules).
+   * Undefined = the `full` loadout: every module renders and committed bytes are unchanged.
+   */
+  modules?: ModuleFilter;
+}
+
+/** A resolved loadout: which module ids it leaves out, and which ids can never be left out. */
+export interface ModuleFilter {
+  /** Loadout name, or `adhoc` for a --modules spec. */
+  name: string;
+  excluded: ReadonlySet<string>;
+  pinned: ReadonlySet<string>;
+  /** Unpinned preamble pieces render as if the skill's preamble-tier were at most this. */
+  preambleTierMax?: number;
 }
 
 /** Resolver function signature. args is populated for parameterized placeholders like {{INVOKE_SKILL:name}}. */

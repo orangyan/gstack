@@ -1,90 +1,125 @@
-## Step 18: Documentation sync (via subagent, before PR creation)
+### Prepare the title (Step 18)
 
-**Dispatch /document-release as a subagent** using the Agent tool with `subagent_type: "general-purpose"`. The subagent gets a fresh context window — zero rot from the preceding 17 steps. It also runs the **full** `/document-release` workflow (with CHANGELOG clobber protection, doc exclusions, risky-change gates, named staging, race-safe PR body editing) rather than a weaker reimplementation.
+Prepare the title in a private file; Step 19 posts that file, never a shell string:
 
-**Sequencing:** This step runs AFTER Step 17 (Push) and BEFORE Step 19 (Create PR). The PR is created once from final HEAD with the `## Documentation` section baked into the initial body. No create-then-re-edit dance.
+{{FREE_TEXT_FILE:TITLE_FILE=pr-title}}
 
-**Subagent prompt:**
+1. For an existing open PR/MR (not Step 6.5's early PR, which takes item 2), fill the file from the platform, substituting the
+   printed name, the matched number and `NEW_VERSION`; no title text passes through you:
+   ```bash
+   TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+   gh pr view <pr-number> --json title -q .title | ~/.claude/skills/gstack/bin/gstack-pr-title-rewrite.sh <new-version> --stdin > "$TITLE_FILE" || exit 1
+   ```
+   GitLab reads `glab mr view <pr-number> --output json | jq -r .title` into the same pipe.
+2. For a new PR/MR, write `v<NEW_VERSION> <type>: <summary>` into the file with your file-write tool;
+   `<summary>` names what the user gets, not the mechanism.
+3. Every created or updated title MUST start with `v$NEW_VERSION `; check the file with
+   `grep -Eq '^v<new-version>( |$)' "$TITLE_FILE"` and never publish an unprefixed title.
+4. **NO_VERSION:** replaces items 1-3: keep an existing title (the platform title
+   piped straight into the file), or write `<type>: <summary>`; no version prefix.
 
-> You are executing the /document-release workflow after a code push. Read the full skill file `${HOME}/.claude/skills/gstack/document-release/SKILL.md` and execute its complete workflow end-to-end, including CHANGELOG clobber protection, doc exclusions, risky-change gates, and named staging. Do NOT attempt to edit the PR body — no PR exists yet. Branch: `<branch>`, base: `<base>`.
->
-> After completing the workflow, output a single JSON object on the LAST LINE of your response (no other text after it):
-> `{"files_updated":["README.md","CLAUDE.md",...],"commit_sha":"abc1234","pushed":true,"documentation_section":"<markdown block for PR body's ## Documentation section>"}`
->
-> If no documentation files needed updating, output:
-> `{"files_updated":[],"commit_sha":null,"pushed":false,"documentation_section":null}`
-
-**Parent processing:**
-
-1. Parse the LAST line of the subagent's output as JSON.
-2. Store `documentation_section` — Step 19 embeds it in the PR body (or omits the section if null).
-3. If `files_updated` is non-empty, print: `Documentation synced: {files_updated.length} files updated, committed as {commit_sha}`.
-4. If `files_updated` is empty, print: `Documentation is current — no updates needed.`
-
-**If the subagent fails or returns invalid JSON:** Print a warning and proceed to Step 19 without a `## Documentation` section. Do not block /ship on subagent failure. The user can run `/document-release` manually after the PR lands.
+Save the title file name for Step 19.
 
 ---
 
 ## Step 19: Create PR/MR
 
-**Idempotency check:** Check if a PR/MR already exists for this branch.
+Recheck Step 18's PR/MR lookup and record it. Errors or ambiguous matches STOP publication.
+If the open PR/MR or title changed, repeat Step 18's identity/title preparation,
+then return here for a new lookup and a fresh body before publishing.
 
-**If GitHub:**
-```bash
-gh pr view --json url,number,state -q 'if .state == "OPEN" then "PR #\(.number): \(.url)" else "NO_PR" end' 2>/dev/null || echo "NO_PR"
-```
+### Resolve Linked Spec before composing the body
 
-**If GitLab:**
-```bash
-glab mr view -F json 2>/dev/null | jq -r 'if .state == "opened" then "MR_EXISTS" else "NO_MR" end' 2>/dev/null || echo "NO_MR"
-```
+1. Resolve the archive directory and branch:
+   ```bash
+   GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+   SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG)
+   CURRENT_BRANCH=$(git branch --show-current)
+   SPEC_ARCHIVES="$GSTACK_STATE_ROOT/projects/$SLUG/specs"
+   ```
+2. Read archive frontmatter as data, never shell source. Select an exact
+   `spec_branch` match to `CURRENT_BRANCH`; among matches use the newest
+   `spec_filed_at`. Never infer an issue number from a branch name. If no readable
+   match or positive integer `spec_issue_number`, omit only `## Linked Spec` and
+   continue composing the PR. Resolve ambiguous matches before linking an issue.
+3. Compare that spec's acceptance criteria with Step 8's results. Only fully
+   completed Step 8 plan scope permits `Closes #N`, with every spec criterion
+   verified. Partial, deferred, failed, dropped or unverified scope uses `Linked to #N`
+   and names the remaining work; never auto-close it. Include the archive filename
+   and `spec_filed_at`, not a private absolute path; `gstack-post` scans them with the body.
 
-If an **open** PR/MR already exists: **update** the PR body using `gh pr edit --body-file "$PR_BODY_FILE"` (GitHub) or `glab mr update -d ...` (GitLab). Always regenerate the PR body from scratch using this run's fresh results (test output, coverage audit, review findings, adversarial review, TODOS summary, documentation_section from Step 18). Never reuse stale PR body content from a prior run. **Run the same redaction scan-at-sink (PR body + title) as the create path (Step 19) before editing — scan the temp file, then `gh pr edit --body-file` from it.**
+### Issue links
 
-**REST fallback (#1079):** on some repos `gh pr edit` hard-errors with a GraphQL deprecation mentioning `repository.pullRequest.projectCards` ("Projects (classic) is being deprecated..."). That is a `gh` GraphQL-path problem, not a permissions problem — do not re-ask for auth. Fall back to the REST endpoint, which never touches the deprecated field, using the SAME already-scanned temp file: `PR_NUMBER=$(gh pr view --json number -q .number)` then `gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" -X PATCH -F body=@"$PR_BODY_FILE"` for the body, and `gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" -X PATCH -f title="$NEW_TITLE"` when the title edit below hits the same error. Verify with the same self-checks as the primary path.
+Run `~/.claude/skills/gstack/bin/gstack-issue-links --base <base> --out .gstack/tmp/issues.json`, adding
+`--issue <n>` per issue the user named as fixed and `--ci-run <id>` per failing CI run. Interactive:
+ask once about its `(promote: fix #N)` references (each `fix #<n>` reply adds `--issue <n>`), and add
+`--supersedes <n>`/`--credit <n>` for a `Related:` PR only when the owner confirms; rerun after any change.
+The completion message lists unpromoted candidates, `Related:` lines and any `ISSUE_LOOKUP_FAILED`.
 
-**Always update the PR title to start with `v$NEW_VERSION`.** PR titles use the workspace-aware format `v<NEW_VERSION> <type>: <summary>` — version ALWAYS first, no exceptions, no "custom title kept intentionally" escape hatch. The shared helper `bin/gstack-pr-title-rewrite.sh` is the single source of truth for the rule.
+### Capy
 
-1. Read the current title: `CURRENT=$(gh pr view --json title -q .title)` (or `glab mr view -F json | jq -r .title`).
-2. Compute the corrected title: `NEW_TITLE=$(~/.claude/skills/gstack/bin/gstack-pr-title-rewrite.sh "$NEW_VERSION" "$CURRENT")`. The helper handles three cases: title already correct (no-op), title has a different `v<X.Y.Z.W>` prefix (replace it), or title has no version prefix (prepend one).
-3. If `NEW_TITLE` differs from `CURRENT`, run `gh pr edit --title "$NEW_TITLE"` (or `glab mr update -t "$NEW_TITLE"`).
-4. **Self-check:** re-fetch the title and assert it starts with `v$NEW_VERSION `. If it does not, retry the edit once. If still wrong, surface the failure to the user.
+Run `[ "${GSTACK_CAPY:-}" = 1 ] && echo 'CAPY_PR: on' || echo 'CAPY_PR: off'`. On `CAPY_PR: on`, read
+`~/.claude/skills/gstack/ship/sections/capy-pr.md` now: the body opens with its `## What changed`,
+`## Why` and `## Approvals` before the sections below. On `CAPY_PR: off`, skip it.
 
-This keeps the title truthful when Step 12's queue-drift detection rebumps a stale version, and forces the format on PRs that were created without it.
-
-Print the existing URL and continue to Step 20.
-
-If no PR/MR exists: create a pull request (GitHub) or merge request (GitLab) using the platform detected in Step 0.
-
-The PR/MR body should contain these sections:
+The PR/MR body should contain these sections (never reuse a prior run's body):
 
 ```
 ## Summary
-<Summarize ALL changes being shipped. Run `git log <base>..HEAD --oneline` to enumerate
-every commit. Exclude the VERSION/CHANGELOG metadata commit (that's this PR's bookkeeping,
-not a substantive change). Group the remaining commits into logical sections (e.g.,
-"**Performance**", "**Dead Code Removal**", "**Infrastructure**"). Every substantive commit
-must appear in at least one section. If a commit's work isn't reflected in the summary,
-you missed it.>
+<Open with the problem in the user's words (what they hit, saw or asked), then the fix
+and what they get now; themes from `git log origin/<base>..HEAD --oneline` after that,
+minus VERSION/CHANGELOG bookkeeping. Never an inventory or a commit list. BAD: "Adds
+gstack-prose-lint, wires Steps 13 and 19, refreshes the goldens." GOOD: "Nobody reads a
+CHANGELOG entry twice, so autopilot words shipped every release. /ship now lints the entry
+before the commit and names each line to rewrite.">
+
+## Blast radius
+<One or two sentences: what else the change touches (callers, consumers, generated
+files, hosts) and the one fact that makes that safe, with the rung of the evidence
+ladder the fact reached (file:line read, walked failure path, script ran, repro). The
+ladder is the `/investigate` skill's Blast radius section, when present.>
 
 ## Test Coverage
 <coverage diagram from Step 7, or "All new code paths have test coverage.">
 <If Step 7 ran: "Tests: {before} → {after} (+{delta} new)">
+<If Step 7 ran: "Coverage: {X}% value-weighted ({Y}% including {W} weakly covered paths)">
+<If Step 7 ran: "Test value: {K} tests written, {R} rejected by the authoring gate, {E} existing tests extended, {W} paths weakly covered (weak = ★, gate-failing or unrated)." Use the singular noun for a count of 1 ("1 test written", "1 existing test extended", "1 path weakly covered").>
+<Weak paths and leftover gaps as proposed tests with value cards; each regression test's
+"Regression proof — fails at HEAD · passes at base · passes after fix" line; Test value
+details for cards whose file type has no known comment syntax.>
+<One line per Step 5 lane: "Tests ran: <lane> N" from its receipt's `tests_ran`, or
+"Tests ran: <lane> count unavailable" when the runner summary was not recognised. A
+ZERO-RUN lane never reaches this body unresolved.>
 
 ## Pre-Landing Review
-<findings from Step 9 code review, or "No issues found.">
+<findings from Step 9 code review, or "No issues found."; then Step 9.4's `REVIEW_LOOP:` line.>
+<Gate edits: Step 9's latest `Gate edits:` line verbatim — `none detected (...)`,
+`N listed, M read, K findings — J kept, R restored, O open`, `partial (...)` or
+`UNAVAILABLE — ...`; never `none detected` for partial or UNAVAILABLE. Under it, each
+kept finding's `gate`, path and `reason`, and each open finding's `gate` and path.
+Identity and reason only; no hunk text.>
+<Outside review: its verdict; `unverified` or `unavailable` is listed as missing coverage with its reason, never as passed.>
+
+<Step 9.4's saved `## Deferred findings` and `## Review notes` sections, verbatim, as their own
+sections here; omit each when empty. References only: never a closing keyword.>
+
+## Exploratory QA
+<Step 9's current surfaces/charters, reproducers, approved regressions and red/green
+proof, fixes and blocked/inconclusive/not-run coverage. Never present stale or
+unavailable results as passing.>
 
 ## Design Review
 <If design review ran: "Design Review (lite): N findings — M auto-fixed, K skipped. AI Slop: clean/N issues.">
+<Detector: "clean" | "N findings (rule-id, rule-id)" | "not installed" | "not cached" | "off" — the state the probe printed; rule ids and counts only, finding text and snippets never reach the PR body.>
 <If no frontend files changed: "No frontend files changed — design review skipped.">
 
 ## Eval Results
 <If evals ran: suite names, pass/fail counts, cost dashboard summary. If skipped: "No prompt-related files changed — evals skipped.">
 
 ## Greptile Review
-<If Greptile comments were found: bullet list with [FIXED] / [FALSE POSITIVE] / [ALREADY FIXED] tag + one-line summary per comment>
-<If no Greptile comments found: "No Greptile comments.">
-<If no PR existed during Step 10: omit this section entirely>
+<Step 10 complete: list comments with [FIXED] / [FALSE POSITIVE] / [ALREADY FIXED], or "No Greptile comments." for a successful empty fetch.>
+<Step 10 unavailable: include `Greptile triage: UNAVAILABLE (dispatch failed)` and the actual reason.>
+<Step 10 no_pr: omit this section.>
 
 ## Scope Drift
 <If scope drift ran: "Scope Check: CLEAN" or list of drift/creep findings>
@@ -92,46 +127,22 @@ you missed it.>
 
 ## Plan Completion
 <If plan file found: completion checklist summary from Step 8>
-<If no plan file: "No plan file detected.">
+<If Step 8 printed the not-run line: that line verbatim.>
 <If plan items deferred: list deferred items>
 
 ## Linked Spec
-<Auto-detect: look for /spec archives matching this branch via:
-  eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
-  eval "$(~/.claude/skills/gstack/bin/gstack-slug)"
-  CURRENT_BRANCH=$(git branch --show-current)
-  SPEC_ARCHIVES="$GSTACK_STATE_ROOT/projects/$SLUG/specs"
-  # Find newest archive whose spec_branch frontmatter matches current branch (or one of its
-  # parents — if spec spawned worktree spec/<slug>-$$, the spawned worktree IS where /ship runs).
-  SPEC_FILE=$(grep -l "^spec_branch: $CURRENT_BRANCH$" "$SPEC_ARCHIVES"/*.md 2>/dev/null | head -1)
-  [ -z "$SPEC_FILE" ] && exit  # no spec; omit this section entirely
-  SPEC_ISSUE=$(grep "^spec_issue_number:" "$SPEC_FILE" | cut -d' ' -f2)
-  [ -z "$SPEC_ISSUE" ] && exit  # spec archive exists but no issue number; omit
+<Closes #N only when the Linked Spec check above permits it; otherwise
+"Linked to #N (partial delivery — not auto-closing)" with remaining work and
+"Close #N manually after follow-up lands." Include archive filename and filed date.
+Without a valid match, omit this entire section.>
 
-  # CONDITIONAL Closes #N (codex F4): only add when Plan Completion above is "complete".
-  # If the plan completion gate from Step 8 reports any deferred or failed items, emit:
-  #   "Linked to #$SPEC_ISSUE (partial delivery — NOT auto-closing; close manually after follow-up)"
-  # If Plan Completion is fully complete, emit:
-  #   "Closes #$SPEC_ISSUE"
-  # and include the Closes #N line in the PR body so GitHub auto-closes on merge.>
-
-<Format:
-  Closes #<N>
-
-  This PR delivers the spec at <archive path relative to repo root>.
-  Spec filed: <spec_filed_at from frontmatter>>
-
-<If partial delivery, emit instead:
-  Linked to #<N> (partial delivery — not auto-closing).
-  Deferred items: <list from Plan Completion>.
-  Close #<N> manually after follow-up lands.>
-
-<If no /spec archive matches this branch: omit this entire section.>
+## Issues
+<Issue links stdout, verbatim; omit on ISSUE_LINKS: none.>
 
 ## Verification Results
-<If verification ran: summary from Step 8.1 (N PASS, M FAIL, K SKIPPED)>
-<If skipped: reason (no plan, no server, no verification section)>
-<If not applicable: omit this section>
+<Step 8.1 obligations executed at Step 9: N PASS, M FAIL, K BLOCKED, J NOT RUN,
+not-applicable reasons, unresolved obligations and accepted deferrals.
+Unavailable/inconclusive is never PASS.>
 
 ## TODOS
 <If items marked complete: bullet list of completed items with version>
@@ -140,67 +151,142 @@ you missed it.>
 <If TODOS.md doesn't exist and user skipped: omit this section>
 
 ## Documentation
-<Embed the `documentation_section` string returned by Step 18's subagent here, verbatim.>
-<If Step 18 returned `documentation_section: null` (no docs updated), omit this section entirely.>
+<Embed Step 14.5's vetted nonempty `documentation_section` for this invocation:
+its saved section file, inserted unchanged by the compose block's `DOCS_SECTION_FILE` lines.
+A blocked audit shipped under a user exception has no section file: state its
+blocked status, scope and exception here and drop the block's `DOCS_SECTION_FILE` guard
+and its `cat -- "$DOCS_SECTION_FILE" && echo &&` step. The exception is one line,
+word for word as Step 14.5 saved it in `.gstack/tmp/docs-audit.json`:
+`Documentation exception: accepted by <accepted_by> <date> via <via>: <reason>`;
+the receipt write below refuses (`DOCS_AUDIT_BLOCKED`) when the body lacks it.>
+<Always include the status and reviewed scope: updated, current, or blocked with the actual user's named risk exception. Never omit this section or reuse another invocation's audit.>
 
 ## Test plan
-- [x] All Rails tests pass (N runs, 0 failures)
-- [x] All Vitest tests pass (N tests)
+- [x] <Each executed test lane's command>: <observed passing summary>
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
 
-#### Redaction scan (PR body + title) — runs before create AND edit
+#### Compose the body, then publish through gstack-post
 
-The PR body is world-readable on a public repo. Scan-at-sink before sending:
-write the composed body to a temp file, scan THAT file with the shared engine,
-and pass the same file to `gh`/`glab`. Wrap any Codex / Greptile / eval output
-sections in tool-attributed fences (` ```codex-review ` / ` ```greptile `) so the
-engine WARN-degrades the example credentials those tools quote instead of blocking
-the PR (a live-format credential inside the fence still blocks).
+The PR body is world-readable on a public repo. `gstack-post` scans the exact title
+and body bytes it sends and passes them to `gh`/`glab` as arguments, so there is no
+separate scan here. Wrap any Codex / Greptile / eval output sections in
+tool-attributed fences (` ```codex-review ` / ` ```greptile `) so the scanner
+WARN-degrades the example credentials those tools quote instead of blocking the PR
+(a live-format credential inside the fence still blocks).
 
-```bash
-REDACT_VIS=$(~/.claude/skills/gstack/bin/gstack-config get redact_repo_visibility 2>/dev/null)
-[ -z "$REDACT_VIS" ] && REDACT_VIS=$(gh repo view --json visibility -q .visibility 2>/dev/null | tr 'A-Z' 'a-z')
-REDACT_VIS="${REDACT_VIS:-unknown}"
-PR_BODY_FILE=$(mktemp)
-cat > "$PR_BODY_FILE" <<'PR_BODY_EOF'
-<PR body from above>
-PR_BODY_EOF
-~/.claude/skills/gstack/bin/gstack-redact --from-file "$PR_BODY_FILE" --repo-visibility "$REDACT_VIS" --self-email "$(git config user.email 2>/dev/null)" --json
-case $? in
-  3) echo "BLOCKED — credential in PR body. Rotate + redact, do not create the PR."; exit 1 ;;
-  2) echo "MEDIUM findings — confirm per finding (sterner on public) before proceeding." ;;
-esac
-# Also scan the title (short, single-line):
-printf '%s' "v$NEW_VERSION <type>: <summary>" | ~/.claude/skills/gstack/bin/gstack-redact --repo-visibility "$REDACT_VIS" --json
-```
+Write the body from above into two private files: the first through the
+`## Documentation` heading line, the second from `## Test plan` on.
 
-HIGH blocks (exit 3, no skip). MEDIUM → AskUserQuestion (PII subset offers
-`--auto-redact`). Same scan runs before the `gh pr edit --body` path (Step 17).
+{{FREE_TEXT_FILE:BODY_TOP_FILE=pr-body-top:BODY_REST_FILE=pr-body-rest}}
 
-**If GitHub:** create from the SCANNED file (exact bytes scanned = bytes sent):
+In a new shell, restore Step 14.5's saved section file path as `DOCS_SECTION_FILE`
+and substitute the printed names. The block deletes both drafts; to change the body,
+write fresh ones.
 
 ```bash
-# PR title MUST start with v$NEW_VERSION — enforced on every run, no exceptions.
-# (See Step 19 idempotency block + bin/gstack-pr-title-rewrite.sh for the rule.)
-gh pr create --base <base> --title "v$NEW_VERSION <type>: <summary>" --body-file "$PR_BODY_FILE"
-rm -f "$PR_BODY_FILE"
+: "${DOCS_SECTION_FILE:?Restore the saved Step 14.5 section file path before composing}"
+PR_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/gstack-pr-body.XXXXXX") || { echo "ERROR: mktemp failed — cannot compose the PR body; refusing to publish." >&2; exit 1; }
+BODY_TOP_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<body-top-file-name>"
+BODY_REST_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<body-rest-file-name>"
+[ -s "$BODY_TOP_FILE" ] && [ -s "$BODY_REST_FILE" ] || { echo "Not composed: $BODY_TOP_FILE or $BODY_REST_FILE is empty, so the body was never written. Write both, then rerun." >&2; exit 1; }
+~/.claude/skills/gstack/bin/gstack-prose-lint "$BODY_TOP_FILE" --sections 'Why,Summary,Blast radius' --gate >&2 || { echo "Not composed: fix what gstack-prose-lint printed above (a PROSE: line is a sentence to rewrite in the draft; a usage line means the draft lost a heading), then rerun." >&2; exit 1; }
+{ awk 1 "$BODY_TOP_FILE" && cat -- "$DOCS_SECTION_FILE" && echo && awk 1 "$BODY_REST_FILE"; } > "$PR_BODY_FILE" || exit 1
+rm -f "$BODY_TOP_FILE" "$BODY_REST_FILE"
+echo "PR_BODY_FILE: $PR_BODY_FILE"
 ```
 
-**If GitLab:**
+Handoff record first (identifiers survive truncation). Write Step 16 stage 4's
+per-lane counts (`{"<lane>":{"pass":N,"fail":N,"skip":N}}`) to
+`.gstack/tmp/ship-gate.json` with your file-write tool, then:
 
 ```bash
-# MR title MUST start with v$NEW_VERSION — enforced on every run, no exceptions.
-# (See Step 19 idempotency block + bin/gstack-pr-title-rewrite.sh for the rule.)
-glab mr create -b <base> -t "v$NEW_VERSION <type>: <summary>" -d "$(cat <<'EOF'
-<MR body from above>
-EOF
-)"
+rm -f .gstack/tmp/review-loop.json
+~/.claude/skills/gstack/bin/gstack-review-scope summary --since "$REVIEW_SINCE" --out .gstack/tmp/review-loop.json &&
+~/.claude/skills/gstack/bin/gstack-ship-receipt write --pr <pr-number> --base <base> --gate @.gstack/tmp/ship-gate.json --pregate .gstack/tmp/pregate.json --issues @.gstack/tmp/issues.json --review-loop @.gstack/tmp/review-loop.json --docs @.gstack/tmp/docs-audit.json --body "$PR_BODY_FILE"
 ```
 
-**If neither CLI is available:**
-Print the branch name, remote URL, and instruct the user to create the PR/MR manually via the web UI. Do not stop — the code is pushed and ready.
+A Step 5 red-base pause adds `--base-red <pause file>` (a conditional receipt the queue
+refuses, `QUEUE_RECEIPT_CONDITIONAL`). `--docs` reads the record Step 14.5 saved (`{status, scope[, exception]}`): the
+receipt carries it as `docs`, and a `blocked` status without the owner's exception,
+or a body missing the exception line, is `DOCS_AUDIT_BLOCKED` with nothing written.
+When the owner accepted a stop after a fix-check edit, add
+`--review-loop-exception @<file>` (`{accepted_by, date, via, reason, fix_check: {head, findings}}`)
+and put its printed `Review-loop exception:` line in the body; never a prose line under `REVIEW_LOOP:`.
+
+The summary reads this branch's review log for the invocation's passes (its
+`REVIEW_LOOP:` line is the one the Pre-Landing Review section carries). The `&&`
+matters: a summary that refuses (no pass matched `REVIEW_SINCE`) must not let `write`
+record a stale or empty loop file.
+
+Add `--receipt .gstack/tmp/tree-receipt.json` only when Step 16 wrote it (gate-ahead).
+New PR/MR: omit `--pr`, then rerun with the number after creation and repost the body.
+Its `SHIP_RECEIPT:` line opens the completion message. The posted receipt is what
+`gstack-ship-queue ready`, `train build` and `verify --train` require (`QUEUE_RECEIPT_MISSING`,
+`QUEUE_RECEIPT_STALE`, no flag around them), so /ship runs before every READY and after any
+push. `RECEIPT_INVALID` names the bad
+field: fix that input file and rerun; nothing was written. `ISSUE_LINKS_MISSING`: add
+the named line under `## Issues` and rerun. `PREGATE_STALE` means rerun
+`gstack-pregate` on the stamped tree; `PREGATE_REMOTE_UNCLEARED` needs
+`gstack-pregate clear` with the run URL. Both stop publication.
+
+In each block below, restore the literal `PR_BODY_FILE` path and substitute Step 18's
+title file name; `gstack-post` detects GitHub or GitLab from the remote and the repo's
+visibility (an unavailable lookup, including on GitLab, uses the scanner's
+public-strict policy). Never re-render the body: every retry sends the same files.
+
+**Existing open PR/MR** (`<pr-number>` from the recheck):
+
+```bash
+TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+~/.claude/skills/gstack/bin/gstack-post pr-body <pr-number> --body-file "${PR_BODY_FILE:?restore the composed body path}" && \
+~/.claude/skills/gstack/bin/gstack-post pr-title <pr-number> --title-file "$TITLE_FILE"
+```
+
+It updates the body, then the title, retries a retired-GraphQL edit through REST and
+reads the title back. Then resolve the draft state from Step 9's gate findings:
+
+1. Step 6.5 opened this PR as an early draft, the user did not ask for a draft, and no
+   gate finding is `open`: mark it ready now with `gh pr ready <pr-number>`.
+2. Step 6.5 opened it as an early draft and any gate finding is `open`: leave it a
+   draft; print `Draft kept: Gate edits: N open` and the open findings' `gate` and path.
+3. The PR was already ready (not a draft) and any gate finding is `open`: publish only
+   under Step 17's recorded human authorisation (option B there); the body already
+   carries the `Gate edits: N open` banner. Without that record, STOP here and report.
+
+Print the existing URL and continue to Step 20; do not run the create command below.
+
+**No open PR/MR:** add `--draft` when any gate finding is `open` (a later agent never
+infers approval from the PR existing; the human marks it ready after dispositioning
+the open items). Otherwise create it ready:
+
+```bash
+TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+~/.claude/skills/gstack/bin/gstack-post pr-create --base <base> --title-file "$TITLE_FILE" --body-file "${PR_BODY_FILE:?restore the composed body path}"
+```
+
+With open gate findings the same command carries `--draft` before `--title-file`.
+
+Branch on the exit code of either block:
+- **0** posted. Remove `$PR_BODY_FILE` and the title file.
+- **1** HIGH finding: BLOCKED — do not publish. Rotate and redact at the source, then
+  compose fresh files.
+- **2** MEDIUM findings, printed as `RULE:` lines with a `TOKEN:`. AskUserQuestion per
+  finding (sterner on public repos, no batch acknowledge). PII offers auto-redact:
+  write `~/.claude/skills/gstack/bin/gstack-redact --from-file "$PR_BODY_FILE" --auto-redact <ids>`
+  output back into the body file and rerun the block, which scans again. Only when the
+  user accepts the findings as they are, rerun the same block with
+  `--confirm <confirm-token>` added to the command that printed it; any edit needs a new token.
+- **64** with stderr saying the current body holds a title `more than once`: nothing was
+  posted. STOP and report the duplicated titles; never rerun with `--replace` yourself,
+  since a human picks which copy stays (docs/troubleshooting.md#gstack-post-pr-body-merge).
+- **3** `gh`/`glab` failed, or any other **64** (no usable remote or CLI): print the error, the
+  branch name, the remote URL and the block for posting by hand. Do not stop — the code
+  is pushed — but never report a PR that was not created. With open gate findings,
+  also say the gate edits were not disclosed and leave the Step 16 open-items report
+  in the invocation record; never report the disclosure as done.
+- Any other exit is an error that blocks publication until its cause is fixed.
 
 **Output the PR/MR URL** — then proceed to Step 20.
 

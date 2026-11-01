@@ -15,9 +15,7 @@
 //     token cost. Same rationale as test/setup-gbrain-path4-structure.test.ts.
 //   - The correct invocation form and the stale one differ only by
 //     `bun run ` + `.ts`, right next to each other in the same files —
-//     exactly the kind of drift a cheap structural check exists to catch,
-//     matching this repo's convention (e.g. test/memory-ingest-no-put_page.test.ts
-//     pinning fix #1346).
+//     exactly the kind of drift a cheap structural check exists to catch.
 
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
@@ -25,9 +23,28 @@ import * as path from 'path';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const TMPL = path.join(ROOT, 'setup-gbrain', 'SKILL.md.tmpl');
+const SECTIONS_DIR = path.join(ROOT, 'setup-gbrain', 'sections');
 const MEMORY_DOC = path.join(ROOT, 'setup-gbrain', 'memory.md');
 
+// Carve-aware (token-reduction Phase 4): setup-gbrain is carved. The Step 7.5
+// ingest-gate body (which owns the R1-R4 invocations) lives in
+// sections/transcript-gate.md.tmpl; the skeleton keeps dispatch + the Step 10
+// verdict prose. Negative (no-bare-invocation) checks run over the UNION so a
+// stale form can't hide in any template file.
 const tmpl = fs.readFileSync(TMPL, 'utf-8');
+const transcriptGate = fs.readFileSync(
+  path.join(SECTIONS_DIR, 'transcript-gate.md.tmpl'),
+  'utf-8',
+);
+const tmplUnion = [tmpl]
+  .concat(
+    fs
+      .readdirSync(SECTIONS_DIR)
+      .filter((f) => f.endsWith('.md.tmpl'))
+      .sort()
+      .map((f) => fs.readFileSync(path.join(SECTIONS_DIR, f), 'utf-8')),
+  )
+  .join('\n');
 const memoryDoc = fs.readFileSync(MEMORY_DOC, 'utf-8');
 
 // A "bare invocation" is the tool name immediately followed by a flag/arg
@@ -42,48 +59,53 @@ const memoryDoc = fs.readFileSync(MEMORY_DOC, 'utf-8');
 const bareMemoryIngest = /\bgstack-memory-ingest\b(?!\.ts)(?:\s|\\\r?\n)+--/;
 const bareGbrainSync = /\bgstack-gbrain-sync\b(?!\.ts)(?:\s|\\\r?\n)+--/;
 
-describe('setup-gbrain/SKILL.md.tmpl — bin invocation paths', () => {
-  test('no bare gstack-memory-ingest invocation remains', () => {
-    expect(tmpl).not.toMatch(bareMemoryIngest);
+describe('setup-gbrain templates (skeleton + sections) — bin invocation paths', () => {
+  test('no bare gstack-memory-ingest invocation remains anywhere in the union', () => {
+    expect(tmplUnion).not.toMatch(bareMemoryIngest);
   });
 
-  test('no bare gstack-gbrain-sync invocation remains', () => {
-    expect(tmpl).not.toMatch(bareGbrainSync);
+  test('no bare gstack-gbrain-sync invocation remains anywhere in the union', () => {
+    expect(tmplUnion).not.toMatch(bareGbrainSync);
   });
 
-  test('the probe step uses bun run + .ts (R1)', () => {
-    expect(tmpl).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe'
+  test('the probe step uses bun run + .ts (R1, transcript-gate section)', () => {
+    expect(transcriptGate).toContain(
+      'bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe'
     );
   });
 
-  test('the silent-bulk mention uses bun run + .ts (R2)', () => {
-    expect(tmpl).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --bulk --quiet'
+  test('the gate never bulk-ingests before the user answers (transcript-gate section)', () => {
+    expect(transcriptGate).not.toMatch(/gstack-memory-ingest\.ts --bulk/);
+  });
+
+  test('the post-answer full-sync step uses bun run + .ts (R3, transcript-gate section)', () => {
+    expect(transcriptGate).toContain(
+      'bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --full --no-brain-sync'
     );
   });
 
-  test('the post-answer full-sync step uses bun run + .ts (R3)', () => {
-    expect(tmpl).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --full --no-brain-sync'
-    );
+  test('no skill-start hook is claimed to ingest transcripts; /sync-gbrain is named (transcript-gate section)', () => {
+    expect(transcriptGate).not.toMatch(/every skill\s+start/i);
+    expect(transcriptGate).toContain('/sync-gbrain');
   });
 
-  test('the preamble-hook incremental-sync mention uses bun run + .ts (R4)', () => {
-    expect(tmpl).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --incremental --quiet'
-    );
+  test('the post-answer gstack-config line stores a mode value, not the answer letter (bash script, no extension)', () => {
+    expect(transcriptGate).toContain('~/.claude/skills/gstack/bin/gstack-config set transcript_ingest_mode');
+    expect(transcriptGate).not.toContain('transcript_ingest_mode <choice>');
   });
+});
 
-  test('the neighboring gstack-config line in the post-answer block is untouched (bash script, no extension)', () => {
-    expect(tmpl).toContain(
-      '~/.claude/skills/gstack/bin/gstack-config set transcript_ingest_mode <choice>'
-    );
-  });
-
-  test('the prose-only mention naming the tool as a sentence subject is left unchanged (KTD4 — not a literal invocation)', () => {
-    expect(tmpl).toContain('gstack-memory-ingest now persists staged transcripts to');
-  });
+describe('transcript consent question is gated on `gstack-config has`', () => {
+  const syncTmpl = fs.readFileSync(path.join(ROOT, 'sync-gbrain', 'SKILL.md.tmpl'), 'utf-8');
+  for (const [name, text] of [['setup-gbrain transcript gate', transcriptGate], ['sync-gbrain', syncTmpl]] as const) {
+    test(`${name} checks presence with has before asking, and never asks spawned or headless sessions`, () => {
+      const hasAt = text.indexOf('gstack-config has transcript_ingest_mode');
+      expect(hasAt).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf('AskUserQuestion', hasAt)).toBeGreaterThan(hasAt);
+      for (const v of ['recent', 'all', 'off']) expect(text).toContain(`\`${v}\``);
+      expect(text).toMatch(/spawned[\s\S]{0,40}headless[\s\S]{0,80}do not ask/i);
+    });
+  }
 });
 
 describe('setup-gbrain/memory.md — bin invocation paths', () => {

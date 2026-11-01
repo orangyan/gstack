@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * PreToolUse hook for AskUserQuestion (Claude Code, plan-tune cathedral T6).
  *
@@ -10,7 +10,9 @@
  *      enforcement is skipped for this question (D18 — hash IDs are
  *      observed-only, never used as preference keys).
  *   2. Look up door_type from scripts/question-registry.ts (default two-way).
- *   3. Read preferences with precedence: project-local > global (D8).
+ *   3. Resolve the project bucket from gstack-slug's versioned slug-cache
+ *      entry for cwd (#2901); unresolved identity fails open to ASKING.
+ *      Read preferences with precedence: project-local > global (D8).
  *   4. Apply:
  *        never-ask + one-way → pass through (safety override; one-way always asks).
  *        never-ask + two-way + marker → deny with auto-decided recommendation
@@ -42,10 +44,13 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { runBin, repoRoot } from './spawn-bin';
 import { isConductor } from '../../../lib/is-conductor';
 import { classifyQuestion } from '../../../scripts/one-way-doors';
+import { SPAWNED_ESCAPE_SENTENCE, CONDUCTOR_SPAWNED_DENY_REASON, spawnedByEnv } from './spawned-directive';
+import { resolveStateRoot } from '../../../lib/state-root';
+import { readVersionedSlugCache } from '../../../lib/bin-context';
+import { logHookError as sharedLogHookError } from './hook-log';
 
 interface HookStdin {
   session_id?: string;
@@ -65,25 +70,10 @@ interface HookStdin {
 const MARKER_RE = /<gstack-qid:([a-z0-9-]{1,64})>/i;
 const RECOMMENDED_LABEL_RE = /\(recommended\)\s*$/i;
 
-function stateRoot(): string {
-  return (
-    process.env.GSTACK_STATE_ROOT ||
-    process.env.GSTACK_HOME ||
-    path.join(os.homedir(), '.gstack')
-  );
-}
+const stateRoot = (): string => resolveStateRoot();
 
 function logHookError(msg: string): void {
-  try {
-    const sr = stateRoot();
-    fs.mkdirSync(sr, { recursive: true });
-    fs.appendFileSync(
-      path.join(sr, 'hook-errors.log'),
-      `${new Date().toISOString()} question-preference-hook: ${msg}\n`,
-    );
-  } catch {
-    // last-resort swallow
-  }
+  sharedLogHookError('question-preference-hook', msg);
 }
 
 function readStdin(): Promise<string> {
@@ -296,13 +286,25 @@ function extractRecommended(
   return { recommended: undefined, ambiguous: false };
 }
 
-function slugFromCwd(cwd: string | undefined): string {
-  // Mirror gstack-slug's basename fallback. The full slug resolver shells out
-  // to git, which is too expensive on a hot hook path; the basename is close
-  // enough for preference lookup (preferences are keyed by question_id, slug
-  // is just the directory bucket).
-  if (!cwd) return 'unknown';
-  return path.basename(cwd);
+type ProjectSlug = { slug: string } | { unresolved: string };
+
+/**
+ * The bucket gstack-question-preference writes to (#2901): the same slug
+ * bin/gstack-slug resolves, read from its versioned per-path slug-cache entry
+ * (lib/bin-context.ts key encoding) so this hot path never spawns git. The
+ * skill preamble runs gstack-slug in this cwd before any question, so a miss
+ * means identity is genuinely unknown: the caller then asks instead of
+ * auto-deciding (a basename guess filed never-ask under a bucket no writer
+ * uses, and a project-local always-ask could be silently overridden by a
+ * global never-ask). GSTACK_PROJECT_SLUG wins, as in gstack-slug.
+ */
+function resolveProjectSlug(cwd: string | undefined): ProjectSlug {
+  const envSlug = (process.env.GSTACK_PROJECT_SLUG || '').trim().replace(/[^a-zA-Z0-9._-]/g, '');
+  if (envSlug && envSlug !== '.' && envSlug !== '..') return { slug: envSlug };
+  if (!cwd) return { unresolved: 'the hook input has no cwd' };
+  const cached = readVersionedSlugCache(stateRoot(), cwd);
+  if (cached) return { slug: cached };
+  return { unresolved: `no versioned gstack-slug cache entry for ${cwd}` };
 }
 
 function markAutoDecided(sessionId: string | undefined, toolUseId: string | undefined): void {
@@ -330,6 +332,7 @@ function logAutoDecided(
   sessionId: string | undefined,
   toolUseId: string | undefined,
   cwd: string | undefined,
+  source: string = 'auto-decided',
 ): void {
   try {
     const payload: Record<string, unknown> = {
@@ -339,7 +342,7 @@ function logAutoDecided(
       options_count: optionsCount,
       user_choice: recommended.slice(0, 64),
       recommended: recommended.slice(0, 64),
-      source: 'auto-decided',
+      source,
       session_id: sessionId?.slice(0, 64),
       tool_use_id: toolUseId?.slice(0, 128),
     };
@@ -390,7 +393,7 @@ async function main(): Promise<void> {
   // we deny only if ALL questions have marker + never-ask + safe door type.
   // Mixed cases pass through so the user still gets to answer.
   const registry = loadRegistry();
-  const slug = slugFromCwd(stdin.cwd);
+  const project = resolveProjectSlug(stdin.cwd);
   const memoryNuggets = loadMemoryNuggets(stdin.session_id);
 
   // Compute Layer 8 memory context inline: any nuggets matching the
@@ -426,7 +429,12 @@ async function main(): Promise<void> {
     const marker = qText.match(MARKER_RE);
     if (!marker) { fullyAutoDecidable = false; break; }
     const questionId = marker[1];
-    const pref = lookupPreference(slug, questionId);
+    if ('unresolved' in project) {
+      logHookError(`never-ask not applied to ${questionId}, asking instead: project identity unresolved (${project.unresolved})`);
+      fullyAutoDecidable = false;
+      break;
+    }
+    const pref = lookupPreference(project.slug, questionId);
     if (!pref.preference || pref.preference === 'always-ask') { fullyAutoDecidable = false; break; }
 
     const entry = registry[questionId];
@@ -484,6 +492,68 @@ async function main(): Promise<void> {
   // preference, or door type — including one-way doors, which must reach the
   // human via prose rather than the unreliable tool.
   if (isConductor()) {
+    // #2733: env-level spawned sessions (OpenClaw inside a Conductor
+    // workspace, or a harness launched with GSTACK_SESSION_KIND=spawned in
+    // its env) get an auto-choose deny — a prose brief has no reader there.
+    // LIMITATION: a per-command GSTACK_SESSION_KIND prefix inside a
+    // subagent's bash never reaches this hook (hooks inherit the harness
+    // env); that case is covered by the escape sentence below plus the
+    // dispatching skill's prompt.
+    if (spawnedByEnv()) {
+      // Name the driving env var in the reason — a human whose session was
+      // env-polluted into spawned mode must see WHY in the transcript.
+      const driver =
+        process.env.GSTACK_SESSION_KIND === 'spawned' ? 'GSTACK_SESSION_KIND' : 'OPENCLAW_SESSION';
+      // Deterministic per-question door check (#2733 review): this deny path
+      // performs no preference/door lookup, so detect one-way doors here and
+      // annotate them — a destructive option marked (recommended) must not be
+      // auto-approved on the strength of one prose sentence alone. Registry
+      // PRIMARY, keyword-net fallback (mirrors the never-ask gate above); the
+      // fallback classifies question text AND option labels, so a bland
+      // "Proceed?" with a "Force-push (recommended)" option cannot evade.
+      const oneWayNotes: string[] = [];
+      for (let i = 0; i < questions.length; i++) {
+        const rawText = questions[i]?.question || '';
+        const qText = rawText.replace(MARKER_RE, '').trim();
+        const opts = optionLabels(questions[i]?.options || []);
+        const marker = rawText.match(MARKER_RE);
+        const entry = marker ? registry[marker[1]] : undefined;
+        let oneWay = entry?.door_type === 'one-way';
+        if (!entry) {
+          const optText = opts.join(' / ');
+          try {
+            oneWay = classifyQuestion({ summary: optText ? `${qText} options: ${optText}` : qText }).oneWay;
+          } catch (e) {
+            logHookError(`spawned one-way classifier failed: ${(e as Error).message}`);
+          }
+        }
+        if (oneWay) {
+          oneWayNotes.push(
+            `[one-way door detected: Q${i + 1} — do NOT take the destructive branch even if it is marked (recommended); choose the conservative non-destructive option and record it]`,
+          );
+        }
+        // Forensic record (#2733 review): the deny prevents PostToolUse
+        // capture, and unlike the never-ask path this branch previously left
+        // NO trace of a machine-resolved gate. Log every question.
+        const { recommended } = extractRecommended(rawText, opts);
+        logAutoDecided(
+          marker?.[1] ?? 'unmarked',
+          qText,
+          recommended ?? 'unrecorded',
+          opts.length,
+          stdin.session_id,
+          stdin.tool_use_id,
+          stdin.cwd,
+          'spawned-env-deny',
+        );
+      }
+      deny(
+        `${CONDUCTOR_SPAWNED_DENY_REASON} (spawned driver: ${driver})` +
+          (oneWayNotes.length ? `\n${oneWayNotes.join('\n')}` : '') +
+          (memoryContext ? `\n${memoryContext}` : ''),
+      );
+      return;
+    }
     const conductorReason =
       '[conductor] AskUserQuestion is unreliable in Conductor (native disabled, MCP variant flaky). ' +
       'Do NOT call AskUserQuestion (native or any mcp__*__AskUserQuestion). Render this decision as a ' +
@@ -491,7 +561,8 @@ async function main(): Promise<void> {
       'paragraph per choice carrying its `(recommended)` marker and `Completeness: X/10`; tell the user ' +
       'to reply with a letter, then STOP. For a one-way/destructive confirmation, require an explicit ' +
       'typed confirmation and do NOT proceed on a vague reply. Capture the decision with gstack-question-log ' +
-      '(PostToolUse will not fire on a prose path).' +
+      '(PostToolUse will not fire on a prose path). ' +
+      SPAWNED_ESCAPE_SENTENCE +
       (memoryContext ? `\n${memoryContext}` : '');
     deny(conductorReason);
     return;

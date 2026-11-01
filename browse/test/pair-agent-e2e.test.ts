@@ -27,8 +27,38 @@ import { GSTACK_EXTENSION_ID } from '../src/server';
 const ROOT = path.resolve(import.meta.dir, '../..');
 const SERVER_ENTRY = path.join(ROOT, 'browse/src/server.ts');
 
+const SETUP_WORK_MS = 15_000;
+const CLEANUP_GRACE_MS = 1000;
+type DaemonProcess = Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
+
+// Same bounded draining/cleanup pattern as the tunnel fixture. Unread startup
+// output must not block the child, and errors must survive failed readiness.
+function captureOutput(stream: ReadableStream<Uint8Array>) {
+  let tail = '';
+  let finished = false;
+  const reader = stream.getReader();
+  const done = (async () => {
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        tail = (tail + decoder.decode(value, { stream: true })).slice(-64_000);
+      }
+      tail = (tail + decoder.decode()).slice(-64_000);
+    } catch (error) { tail = (tail + `\n[output capture failed: ${String(error)}]`).slice(-64_000); }
+    finally { finished = true; reader.releaseLock(); }
+  })();
+  return { done, text: () => tail, cancel: () => {
+    if (!finished) void reader.cancel().catch(() => {});
+  } };
+}
+type OutputCapture = ReturnType<typeof captureOutput>;
+
 interface DaemonHandle {
-  proc: ReturnType<typeof Bun.spawn>;
+  proc: DaemonProcess;
+  stdout: OutputCapture;
+  stderr: OutputCapture;
   port: number;
   token: string;
   stateFile: string;
@@ -36,52 +66,121 @@ interface DaemonHandle {
   baseUrl: string;
 }
 
-async function waitForReady(baseUrl: string, timeoutMs = 15_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const resp = await fetch(`${baseUrl}/health`, {
-        signal: AbortSignal.timeout(1000),
-      });
-      if (resp.ok) return;
-    } catch {
-      // not ready yet
+async function stopProcess(proc: DaemonProcess, stdout: OutputCapture, stderr: OutputCapture): Promise<void> {
+  let killError: unknown;
+  if (proc.exitCode === null && proc.signalCode === null) {
+    try { proc.kill('SIGKILL'); } catch (error) { killError = error; }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const settled = await Promise.race([
+      Promise.all([proc.exited, stdout.done, stderr.done]).then(() => true),
+      new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), CLEANUP_GRACE_MS); }),
+    ]);
+    if (!settled) {
+      stdout.cancel(); stderr.cancel();
+      throw new Error(`Owned daemon ${proc.pid} or output did not settle within ${CLEANUP_GRACE_MS}ms cleanup grace${killError ? `; kill failed: ${String(killError)}` : ''}`);
+    }
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+async function waitForReady(proc: DaemonProcess, stateFile: string, assertRunning: () => void, signal: AbortSignal): Promise<{ port: number; token: string }> {
+  for (;;) {
+    signal.throwIfAborted();
+    assertRunning();
+    let state: { pid?: unknown; port?: unknown; token?: unknown } | undefined;
+    try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (state !== undefined) {
+      if (!state || state.pid !== proc.pid || typeof state.port !== 'number' ||
+          !Number.isInteger(state.port) || state.port < 1 || state.port > 65535 ||
+          typeof state.token !== 'string' || !state.token.length) {
+        throw new Error('Daemon state does not identify the owned child with a valid port and token');
+      }
+      let ready = false;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${state.port}/health`, {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(1000)]),
+        });
+        ready = resp.ok;
+        void resp.body?.cancel().catch(() => {});
+      } catch { /* not ready yet; the single setup deadline still applies */ }
+      signal.throwIfAborted();
+      assertRunning();
+      if (ready) return { port: state.port, token: state.token };
     }
     await new Promise(r => setTimeout(r, 200));
   }
-  throw new Error(`Daemon did not become ready within ${timeoutMs}ms`);
 }
 
-async function spawnDaemon(): Promise<DaemonHandle> {
+async function spawnDaemon(options: {
+  // Fixture-only failure injection; the normal work budget remains 15 seconds.
+  launch?: (env: NodeJS.ProcessEnv) => DaemonProcess;
+  setupWorkMs?: number;
+} = {}): Promise<DaemonHandle> {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-agent-e2e-'));
   const stateFile = path.join(tempDir, 'browse.json');
-  // Pick a high ephemeral port
-  const port = 20000 + Math.floor(Math.random() * 20000);
-
-  const proc = Bun.spawn(['bun', 'run', SERVER_ENTRY], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      BROWSE_HEADLESS_SKIP: '1',
-      BROWSE_PORT: String(port),
-      BROWSE_STATE_FILE: stateFile,
-      BROWSE_PARENT_PID: '0',
-      BROWSE_IDLE_TIMEOUT: '600000',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+  let proc: DaemonProcess | undefined;
+  let stdout: OutputCapture | undefined;
+  let stderr: OutputCapture | undefined;
+  const controller = new AbortController();
+  const workMs = Math.min(options.setupWorkMs ?? SETUP_WORK_MS, SETUP_WORK_MS);
+  let timer: ReturnType<typeof setTimeout>;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`Daemon did not become ready within ${workMs}ms`);
+      controller.abort(error);
+      reject(error);
+    }, workMs);
   });
-
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForReady(baseUrl);
-
-  // Read the token from the state file that the daemon wrote
-  const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
-  return { proc, port, token: state.token, stateFile, tempDir, baseUrl };
+  try {
+    return await Promise.race([expired, (async () => {
+      const env = {
+        ...process.env,
+        BROWSE_HEADLESS_SKIP: '1',
+        // Use the daemon's existing checked allocation; discover its actual port
+        // from this child's state file instead of guessing an unchecked override.
+        BROWSE_PORT: '0',
+        BROWSE_STATE_FILE: stateFile,
+        BROWSE_PARENT_PID: '0',
+        BROWSE_IDLE_TIMEOUT: '600000',
+      };
+      proc = options.launch ? options.launch(env) : Bun.spawn(['bun', 'run', SERVER_ENTRY], {
+        cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      stdout = captureOutput(proc.stdout);
+      stderr = captureOutput(proc.stderr);
+      let exitCode: number | undefined;
+      void proc.exited.then(code => { exitCode = code; });
+      const assertRunning = () => {
+        if (exitCode !== undefined) throw new Error(`Daemon exited before setup completed (code ${exitCode}, signal ${proc!.signalCode ?? 'none'})`);
+      };
+      const { port, token } = await waitForReady(proc, stateFile, assertRunning, controller.signal);
+      return { proc, stdout, stderr, port, token, stateFile, tempDir, baseUrl: `http://127.0.0.1:${port}` };
+    })()]);
+  } catch (cause) {
+    // Preserve the original startup file before stopping or awaiting the child.
+    let startupError = '';
+    try { startupError = fs.readFileSync(path.join(tempDir, 'browse-startup-error.log'), 'utf8').slice(-64_000); } catch { /* startup may not have reached the logger */ }
+    let cleanupError: unknown;
+    try { if (proc && stdout && stderr) await stopProcess(proc, stdout, stderr); }
+    catch (error) { cleanupError = error; }
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); }
+    catch (error) { cleanupError ??= error; }
+    throw new Error([
+      cause instanceof Error ? cause.message : String(cause),
+      `Owned daemon PID: ${proc?.pid ?? 'not spawned'}; exit: ${proc?.exitCode ?? 'none'}; signal: ${proc?.signalCode ?? 'none'}`,
+      `stdout tail:\n${stdout?.text() || '(empty)'}`,
+      `stderr tail:\n${stderr?.text() || '(empty)'}`,
+      ...(startupError ? [`startup error file:\n${startupError}`] : []),
+      ...(cleanupError ? [`cleanup failed: ${String(cleanupError)}`] : []),
+    ].join('\n'), { cause });
+  } finally { clearTimeout(timer!); controller.abort(new Error('setup finished')); }
 }
 
-function killDaemon(handle: DaemonHandle): void {
-  try { handle.proc.kill('SIGKILL'); } catch {}
-  try { fs.rmSync(handle.tempDir, { recursive: true, force: true }); } catch {}
+async function killDaemon(handle: DaemonHandle): Promise<void> {
+  try { await stopProcess(handle.proc, handle.stdout, handle.stderr); }
+  finally { fs.rmSync(handle.tempDir, { recursive: true, force: true }); }
 }
 
 describe('pair-agent flow end-to-end (HTTP only, no ngrok)', () => {
@@ -91,8 +190,8 @@ describe('pair-agent flow end-to-end (HTTP only, no ngrok)', () => {
     daemon = await spawnDaemon();
   }, 20_000);
 
-  afterAll(() => {
-    if (daemon) killDaemon(daemon);
+  afterAll(async () => {
+    if (daemon) await killDaemon(daemon);
   });
 
   test('GET /health returns daemon status and NEVER includes a token (even for chrome-extension origins)', async () => {
@@ -291,6 +390,135 @@ describe('pair-agent flow end-to-end (HTTP only, no ngrok)', () => {
     expect(body.hint).not.toContain('--admin');
   });
 
+  // ─── D2: reserved clientId is rejected with a named 400 ───────────────
+
+  test('POST /pair with clientId "root" returns 400 naming the reservation', async () => {
+    const resp = await fetch(`${daemon.baseUrl}/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${daemon.token}` },
+      body: JSON.stringify({ clientId: 'root' }),
+    });
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as any;
+    // The reservation is named, NOT hidden behind the generic "Invalid request body".
+    expect(body.error).toContain('root');
+    expect(body.error).not.toBe('Invalid request body');
+  });
+
+  test('POST /token with clientId "root" returns 400 naming the reservation', async () => {
+    const resp = await fetch(`${daemon.baseUrl}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${daemon.token}` },
+      body: JSON.stringify({ clientId: 'root' }),
+    });
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as any;
+    expect(body.error).toContain('root');
+    expect(body.error).not.toBe('Invalid request body');
+  });
+
+  // ─── D1: a reducing re-pair supersedes the prior grant immediately ────
+
+  const pairAs = async (body: any) => (await (await fetch(`${daemon.baseUrl}/pair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${daemon.token}` },
+    body: JSON.stringify(body),
+  })).json()) as any;
+  const connectKey = async (setup_key: string) => {
+    const r = await fetch(`${daemon.baseUrl}/connect`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ setup_key }),
+    });
+    return { status: r.status, body: await r.json().catch(() => ({})) as any };
+  };
+  const statusWith = (token: string) => fetch(`${daemon.baseUrl}/command`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ command: 'status', args: [] }),
+  });
+
+  test('reducing re-pair revokes the prior session immediately, without exchanging the new key', async () => {
+    const { setup_key: k1 } = await pairAs({ clientId: 'reduce-me' });      // broad
+    const { body: c1 } = await connectKey(k1);
+    const s1 = c1.token as string;
+    expect((await statusWith(s1)).status).not.toBe(401);                    // works
+    // Narrow WITHOUT exchanging the new key — this is the whole bug.
+    const rp = await pairAs({ clientId: 'reduce-me', scopes: ['read'] });
+    expect(rp.superseded?.tokens_deleted).toBeGreaterThanOrEqual(1);
+    expect((await statusWith(s1)).status).toBe(401);                        // old session revoked
+    // The new narrow key still works and yields the reduced scope.
+    const c2 = await connectKey(rp.setup_key);
+    expect(c2.status).toBe(200);
+    expect(c2.body.scopes).toEqual(['read']);
+    expect((await statusWith(c2.body.token)).status).not.toBe(401);
+  });
+
+  test('reducing re-pair BEFORE connect kills the stale broad setup key; only the narrow key works', async () => {
+    const { setup_key: broad } = await pairAs({ clientId: 'shadow' });      // never connected
+    const rp = await pairAs({ clientId: 'shadow', scopes: ['read'] });      // narrowing re-pair
+    expect(rp.superseded).toBeUndefined();                                  // no live session existed
+    expect((await connectKey(broad)).status).toBe(401);                     // stale broad key dead
+    const c = await connectKey(rp.setup_key);
+    expect(c.status).toBe(200);
+    expect(c.body.scopes).toEqual(['read']);                               // narrow key survives
+  });
+
+  test('broadening re-pair does NOT revoke the working session (no outage)', async () => {
+    const first = await pairAs({ clientId: 'broaden', scopes: ['read'] });
+    expect(first.superseded).toBeUndefined();                              // first pair supersedes nothing
+    const { body: c } = await connectKey(first.setup_key);
+    const s = c.token as string;
+    expect((await statusWith(s)).status).not.toBe(401);
+    const rp = await pairAs({ clientId: 'broaden', scopes: ['read', 'write'] }); // broaden
+    expect(rp.superseded).toBeUndefined();                                 // session not superseded
+    expect((await statusWith(s)).status).not.toBe(401);                    // still working
+  });
+
+  test('a reducing re-pair with an INVALID scope 400s and leaves the live session intact', async () => {
+    // Regression: the supersede revoke must run AFTER validation. A scope typo
+    // (--restrict red) on a narrowing re-pair must not destroy the session and
+    // then fail to mint a replacement — the agent would be knocked offline.
+    const { setup_key: k } = await pairAs({ clientId: 'validate-me' });
+    const { body: c } = await connectKey(k);
+    const s = c.token as string;
+    expect((await statusWith(s)).status).not.toBe(401);
+    const resp = await fetch(`${daemon.baseUrl}/pair`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${daemon.token}` },
+      body: JSON.stringify({ clientId: 'validate-me', scopes: ['red'] }),
+    });
+    expect(resp.status).toBe(400);
+    expect((await resp.json() as any).error).toContain('red');
+    // The working session survives the validation error (not revoked).
+    expect((await statusWith(s)).status).not.toBe(401);
+  });
+
+  // ─── D3: DELETE /token releases tabs unconditionally; 404 only when empty ─
+
+  test('DELETE /token returns tabs_released and 404 only when nothing to revoke or release', async () => {
+    const pairResp = await fetch(`${daemon.baseUrl}/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${daemon.token}` },
+      body: JSON.stringify({ clientId: 'd3-agent' }),
+    });
+    const { setup_key } = await pairResp.json() as any;
+    await fetch(`${daemon.baseUrl}/connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ setup_key }),
+    });
+    const del = await fetch(`${daemon.baseUrl}/token/d3-agent`, {
+      method: 'DELETE', headers: { Authorization: `Bearer ${daemon.token}` },
+    });
+    expect(del.status).toBe(200);
+    const body = await del.json() as any;
+    expect(body.tokens_deleted).toBeGreaterThanOrEqual(1);
+    // Headless-skip daemon owns no real tabs, but the field is always present.
+    expect(body.tabs_released).toBe(0);
+    // Nothing to revoke AND nothing to release → 404.
+    const del2 = await fetch(`${daemon.baseUrl}/token/nonexistent-xyz`, {
+      method: 'DELETE', headers: { Authorization: `Bearer ${daemon.token}` },
+    });
+    expect(del2.status).toBe(404);
+  });
+
   // ─── Revocation e2e: revoke-all + the /agents verification surface ────
 
   test('DELETE /token revokes session AND setup keys; agent leaves /agents; token 401s; re-connect fails', async () => {
@@ -461,4 +689,105 @@ describe('pair-agent flow end-to-end (HTTP only, no ngrok)', () => {
     // Must not include path-traversal-decoded content
     expect(body).not.toContain('root:x:0:0'); // /etc/passwd signature
   });
+});
+
+
+describe('pair-agent fixture startup ownership', () => {
+  test('an occupied unchecked random choice does not strand automatic startup', async () => {
+    let occupied: ReturnType<typeof Bun.serve> | undefined;
+    for (let attempt = 0; attempt < 20 && !occupied; attempt++) {
+      try {
+        occupied = Bun.serve({ hostname: '127.0.0.1', port: 20000 + Math.floor(Math.random() * 20000),
+          fetch: () => new Response('occupied', { status: 503 }) });
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error; }
+    }
+    if (!occupied) throw new Error('Could not reserve the collision control port');
+    const random = Math.random;
+    const priorPort = process.env.BROWSE_PORT;
+    let handle: DaemonHandle | undefined;
+    try {
+      // The previous helper deterministically chooses the already-held port.
+      // The fixed child uses its own checked allocation and written state.
+      Math.random = () => (occupied!.port - 20000 + 0.5) / 20000;
+      process.env.BROWSE_PORT = String(occupied.port);
+      handle = await spawnDaemon();
+      expect(handle.port).not.toBe(occupied.port);
+      expect(JSON.parse(fs.readFileSync(handle.stateFile, 'utf8')).pid).toBe(handle.proc.pid);
+      expect((await fetch(`${handle.baseUrl}/health`)).status).toBe(200);
+    } finally {
+      Math.random = random;
+      if (priorPort === undefined) delete process.env.BROWSE_PORT;
+      else process.env.BROWSE_PORT = priorPort;
+      try { if (handle) await killDaemon(handle); }
+      finally { occupied.stop(true); }
+    }
+    expect(fs.existsSync(handle!.tempDir)).toBe(false);
+    expect(handle!.proc.exitCode !== null || handle!.proc.signalCode !== null).toBe(true);
+  }, 20_000);
+
+  test('early exit drains bounded output and preserves startup errors before cleanup', async () => {
+    let proc: DaemonProcess | undefined;
+    let tempDir = '';
+    const started = Date.now();
+    let failure: Error | undefined;
+    try {
+      await spawnDaemon({ launch: env => {
+        tempDir = path.dirname(env.BROWSE_STATE_FILE!);
+        proc = Bun.spawn([process.execPath, '-e', `
+          const fs = require('node:fs');
+          fs.writeFileSync(require('node:path').join(require('node:path').dirname(process.env.BROWSE_STATE_FILE), 'browse-startup-error.log'), 'original owned startup failure');
+          await new Promise(resolve => process.stdout.write('x'.repeat(256_000) + '\\nstdout-final\\n', resolve));
+          await new Promise(resolve => process.stderr.write('y'.repeat(256_000) + '\\nstderr-final\\n', resolve));
+          process.exit(23);
+        `], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        return proc;
+      } });
+    } catch (error) { failure = error as Error; }
+    expect(failure?.message).toContain('Daemon exited before setup completed (code 23');
+    expect(failure?.message).toContain('stdout-final');
+    expect(failure?.message).toContain('stderr-final');
+    expect(failure?.message).toContain('original owned startup failure');
+    expect(failure!.message.length).toBeLessThan(130_000);
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(await proc!.exited).toBe(23);
+    expect(fs.existsSync(tempDir)).toBe(false);
+  }, 10_000);
+
+  test('the single setup deadline stops and reaps a child that never becomes ready', async () => {
+    let proc: DaemonProcess | undefined;
+    let tempDir = '';
+    let failure: Error | undefined;
+    try {
+      await spawnDaemon({ setupWorkMs: 100, launch: env => {
+        tempDir = path.dirname(env.BROWSE_STATE_FILE!);
+        proc = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], {
+          env, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        return proc;
+      } });
+    } catch (error) { failure = error as Error; }
+    expect(failure?.message).toContain('Daemon did not become ready within 100ms');
+    expect(proc!.exitCode !== null || proc!.signalCode !== null).toBe(true);
+    expect(fs.existsSync(tempDir)).toBe(false);
+  }, 5000);
+
+  test('state from a different PID cannot authorize a health endpoint', async () => {
+    let proc: DaemonProcess | undefined;
+    let tempDir = '';
+    let failure: Error | undefined;
+    try {
+      await spawnDaemon({ launch: env => {
+        tempDir = path.dirname(env.BROWSE_STATE_FILE!);
+        proc = Bun.spawn([process.execPath, '-e', `
+          require('node:fs').writeFileSync(process.env.BROWSE_STATE_FILE,
+            JSON.stringify({ pid: process.pid + 1, port: 1, token: 'fixture-only' }));
+          setInterval(() => {}, 1000);
+        `], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        return proc;
+      } });
+    } catch (error) { failure = error as Error; }
+    expect(failure?.message).toContain('Daemon state does not identify the owned child');
+    expect(proc!.exitCode !== null || proc!.signalCode !== null).toBe(true);
+    expect(fs.existsSync(tempDir)).toBe(false);
+  }, 5000);
 });

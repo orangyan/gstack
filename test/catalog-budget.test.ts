@@ -24,13 +24,80 @@ import { skillCensus } from './helpers/skill-census';
  *           line item, run parseFrontmatter() below and sum
  *           Buffer.byteLength(name) + Buffer.byteLength(description);
  *           token-equivalents = ceil(bytes / 4).
- *   result  53 authored skills = 4,371 bytes (1,093 token-equivalents);
- *           + root router alias 49 bytes = 4,420 bytes total
- *           = 1,105 token-equivalents (measured 2026-08-12)
- * Ceiling is 1,150 token-equivalents (4,600 bytes), so headroom is 180 bytes
- * (~4%). Dominant skill: design-consultation at 229 bytes name+description.
+ *   ref     deslop-shared-libs addition on base a6b3a575 (2026-09-16)
+ *   result  pre-addition aggregate 4,593 bytes; deslop-shared-libs adds
+ *           82 bytes (name + concise description), yielding 4,675 bytes
+ *           = 1,169 token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,150 + ceil(82 / 4) = 1,171
+ * token-equivalents (4,684 bytes), leaving 9 bytes. Existing descriptions
+ * are unchanged. Dominant skill: design-consultation at 229 bytes.
+ *   ref     test-audit addition on base 943105f1 (2026-09-29)
+ *   result  pre-addition aggregate 4,680 bytes; test-audit adds 92 bytes
+ *           (name + concise description), yielding 4,772 bytes = 1,193
+ *           token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,171 + ceil(92 / 4) = 1,194
+ * token-equivalents (4,776 bytes), leaving 4 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     eval-plan addition on base 7552362 (2026-10-10)
+ *   result  pre-addition aggregate 4,776 bytes; eval-plan adds 10 bytes
+ *           (its description is a `|` block scalar, counted as the other
+ *           block-scalar skills are), yielding 4,786 bytes = 1,197
+ *           token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,194 + ceil(10 / 4) = 1,197
+ * token-equivalents (4,788 bytes), leaving 2 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     captain addition on base ab9a854b (2026-10-26)
+ *   result  pre-addition aggregate 4,786 bytes; captain adds 214 bytes (name
+ *           plus the one-sentence catalog lead naming the /crew alias),
+ *           yielding 5,000 bytes = 1,250 token-equivalents including the root
+ *           router alias.
+ * New-skill ratchet: previous ceiling 1,197 + ceil(214 / 4) = 1,251
+ * token-equivalents (5,004 bytes), leaving 4 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     ubicloud addition on base 4d48d39e (2026-10-26)
+ *   result  pre-addition aggregate 5,000 bytes; ubicloud adds 150 bytes
+ *           (name + the generator's catalog-trimmed one-line description),
+ *           yielding 5,150 bytes = 1,288 token-equivalents including the
+ *           root router alias.
+ * New-skill ratchet: previous ceiling 1,251 + ceil(150 / 4) = 1,289
+ * token-equivalents (5,156 bytes), leaving 6 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     design-motion addition on base 6c5b2d46 (2026-10-27), Garry
+ *           2026-10-25 'Do it' (GSTA-92 plan item 15)
+ *   result  pre-addition aggregate 5,150 bytes; design-motion adds 99 bytes
+ *           (name + the trimmed lead "animate an approved design into a
+ *           seamless MP4 and GIF loop"), yielding 5,249 bytes = 1,313
+ *           token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,289 + ceil(99 / 4) = 1,314
+ * token-equivalents (5,256 bytes), leaving 7 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     modernize addition on base d9b0d600 (2026-10-27), Garry
+ *           2026-10-26 'Do it, send' (plans/absorb-tstack.md item 3)
+ *   result  pre-addition aggregate 5,249 bytes; modernize adds 178 bytes
+ *           (name plus the one-sentence catalog lead naming the three
+ *           verdicts), yielding 5,427 bytes = 1,357 token-equivalents
+ *           including the root router alias.
+ * New-skill ratchet: previous ceiling 1,314 + ceil(178 / 4) = 1,359
+ * token-equivalents (5,436 bytes), leaving 9 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     write-skill addition on base 10b77de (2026-10-27), Garry
+ *           2026-10-27 'Rec' (GSTA-133 plan, autoplan-20261027230116)
+ *   result  pre-addition aggregate 5,427 bytes; write-skill adds 135 bytes
+ *           (name plus the one-sentence catalog lead), yielding 5,562 bytes
+ *           = 1,391 token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,359 + ceil(135 / 4) = 1,393
+ * token-equivalents (5,572 bytes), leaving 10 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     verify addition on base a77fae2 (2026-10-31), GST-116 plan v3
+ *           (autoplan-20261029160221, APPROVED gate_rev 3)
+ *   result  pre-addition aggregate 5,564 bytes; verify adds 118 bytes
+ *           (name plus the one-sentence catalog lead), yielding 5,682 bytes
+ *           = 1,421 token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,393 + ceil(118 / 4) = 1,423
+ * token-equivalents (5,692 bytes), leaving 10 bytes. Existing descriptions
+ * are unchanged.
  */
-const CATALOG_BUDGET_TOKEN_EQUIVALENTS = 1_150;
+const CATALOG_BUDGET_TOKEN_EQUIVALENTS = 1_423;
 
 // Largest today: design-consultation at 229 bytes. A description that needs
 // more than 260 bytes is a body paragraph, not a catalog entry.

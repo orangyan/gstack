@@ -16,7 +16,7 @@
  * factory/opencode can't silently regress.
  */
 import { describe, test, expect } from 'bun:test';
-import { spawnSync } from 'child_process';
+import { runBashScript } from './helpers/bash-script';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -159,13 +159,15 @@ function runInstaller(
     `IS_WINDOWS=${isWindows}`,
     extraVars,
     extractFn('_link_or_copy'),
+    extractFn('_link_runtime_dists'),
+    extractFn('_copy_runtime_skill_refs'),
     // Ownership gates (#2142) — dependencies of every installer under test.
     extractFn('_owned_for_windows_refresh'),
     extractFn('_sidecar_root_user_owned'),
     ...fns.map(extractFn),
     invocation,
   ].join('\n');
-  const r = spawnSync('bash', ['-c', script], { encoding: 'utf-8', timeout: 15_000 });
+  const r = runBashScript(script, { timeout: 15_000 });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 

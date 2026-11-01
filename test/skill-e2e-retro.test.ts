@@ -1,4 +1,6 @@
 import { expect, beforeAll, afterAll } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
+import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
 import {
   ROOT, runId,
@@ -6,13 +8,59 @@ import {
   logCost, recordE2E,
   createEvalCollector, finalizeEvalCollector,
 } from './helpers/e2e-helpers';
-import { extractSkillSections, RETRO_E2E_SECTIONS } from './helpers/skill-fixture';
+import { extractSkillSections } from './helpers/skill-fixture';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
 const evalCollector = createEvalCollector('e2e-retro');
+
+// Carved-skill fixture (retro wave): the repo-scoped retro flow lives in the
+// skeleton's H2 sections below, and the narrative report format lives in
+// retro/sections/report-format.md (the skeleton Step 14 is a STOP-Read
+// pointer). The fixture ships skeleton + section + bin/gstack-retro-metrics —
+// still an extraction, not a full-file copy (sections ARE the minimal
+// on-demand units; same pattern as skill-e2e-review-army.test.ts).
+const RETRO_SKELETON_SECTIONS = [
+  'Step 0: Detect platform and base branch',
+  'User-invocable',
+  'Arguments',
+  'Instructions',
+  'Prior Learnings',
+  'Capture Learnings',
+  'Tone',
+  'Important Rules',
+];
+
+/** Write retro/SKILL.md + sections + the metrics script into a fixture dir. */
+function buildRetroFixture(dir: string): void {
+  let skillMd = extractSkillSections(path.join(ROOT, 'retro'), RETRO_SKELETON_SECTIONS);
+  // The skeleton's STOP-Read points at the installed absolute section path
+  // (~/.claude/skills/gstack/retro/sections/...), which doesn't exist under
+  // the hermetic temp HOME — repoint it at the fixture copy.
+  skillMd = skillMd.replace(
+    /[^\s`]*\/retro\/sections\/report-format\.md/g,
+    path.join(dir, 'retro', 'sections', 'report-format.md'),
+  );
+  fs.mkdirSync(path.join(dir, 'retro', 'sections'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'retro', 'SKILL.md'), skillMd);
+  fs.copyFileSync(
+    path.join(ROOT, 'retro', 'sections', 'report-format.md'),
+    path.join(dir, 'retro', 'sections', 'report-format.md'),
+  );
+  // The Step 1 fence resolves bin/gstack-retro-metrics via
+  // $HOME/.claude/skills/gstack/bin first (absent in the hermetic HOME), then
+  // the cwd-relative .claude/skills/gstack/bin fallback — satisfy the fallback
+  // so the run exercises the real script instead of the degraded path.
+  const binDir = path.join(dir, '.claude', 'skills', 'gstack', 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.copyFileSync(
+    path.join(ROOT, 'bin', 'gstack-retro-metrics'),
+    path.join(binDir, 'gstack-retro-metrics'),
+  );
+  fs.chmodSync(path.join(binDir, 'gstack-retro-metrics'), 0o755);
+}
 
 // --- Retro base branch detection smoke test ---
 
@@ -30,11 +78,10 @@ describeIfSelected('Base branch detection', ['retro-base-branch'], () => {
   });
 
   testConcurrentIfSelected('retro-base-branch', async () => {
-    const dir = path.join(baseBranchDir, 'retro-base');
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = baseBranchDir;
 
-    // Create git repo with commit history
-    run('git', ['init'], dir);
+    // Create git repo with commit history on main, the branch the prompt names
+    run('git', ['init', '-b', 'main'], dir);
     run('git', ['config', 'user.email', 'dev@example.com'], dir);
     run('git', ['config', 'user.name', 'Dev'], dir);
 
@@ -52,11 +99,7 @@ describeIfSelected('Base branch detection', ['retro-base-branch'], () => {
 
     // Retro skill — extract the repo-scoped retro flow only (drops the shared
     // preamble + global/compare modes; CLAUDE.md: "extract, don't copy").
-    fs.mkdirSync(path.join(dir, 'retro'), { recursive: true });
-    fs.writeFileSync(
-      path.join(dir, 'retro', 'SKILL.md'),
-      extractSkillSections(path.join(ROOT, 'retro'), RETRO_E2E_SECTIONS),
-    );
+    buildRetroFixture(dir);
 
     const result = await runSkillTest({
       prompt: `Read retro/SKILL.md for instructions on how to run a retrospective.
@@ -92,7 +135,7 @@ Write your retrospective to ${dir}/retro-output.md`,
     expect(wroteReport).toBe(true);
     const content = fs.readFileSync(retroPath, 'utf-8');
     expect(content.length).toBeGreaterThan(100);
-  }, 480_000);
+  }, CAPTURE_LONG_MS);
 });
 
 // --- Retro E2E ---
@@ -137,12 +180,8 @@ describeIfSelected('Retro E2E', ['retro'], () => {
     run('git', ['add', 'README.md']);
     run('git', ['commit', '-m', 'docs: add README', '--date', '2026-03-12T16:00:00']);
 
-    // Retro skill — extracted repo-scoped flow, not the full 1820-line file.
-    fs.mkdirSync(path.join(retroDir, 'retro'), { recursive: true });
-    fs.writeFileSync(
-      path.join(retroDir, 'retro', 'SKILL.md'),
-      extractSkillSections(path.join(ROOT, 'retro'), RETRO_E2E_SECTIONS),
-    );
+    // Retro skill — extracted repo-scoped flow, not the full file.
+    buildRetroFixture(retroDir);
   });
 
   afterAll(() => {
@@ -159,10 +198,10 @@ Write your retrospective report to ${retroDir}/retro-output.md
 Analyze the git history and produce the narrative report as described in the SKILL.md.`,
       workingDirectory: retroDir,
       maxTurns: 30,
-      timeout: 300_000,
+      timeout: CAPTURE_MS,
       testName: 'retro',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/retro', result);
@@ -178,7 +217,7 @@ Analyze the git history and produce the narrative report as described in the SKI
     expect(wroteReport).toBe(true);
     const retro = fs.readFileSync(retroPath, 'utf-8');
     expect(retro.length).toBeGreaterThan(100);
-  }, 420_000);
+  }, CAPTURE_LONG_MS);
 });
 
 // Module-level afterAll — finalize eval collector after all tests complete

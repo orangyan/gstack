@@ -8,15 +8,34 @@
  * timestamp + scope + reason + CI provenance.
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, beforeEach, afterAll } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { logBudgetOverride } from './budget-override';
 
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-override-test-'));
-process.env.GSTACK_HOME = TMP_HOME;
 const AUDIT_PATH = path.join(TMP_HOME, 'analytics', 'spend-overrides.jsonl');
+
+// GSTACK_HOME is scoped to this file's execution window (beforeAll/afterAll),
+// never set at module load: bun evaluates sibling modules before running
+// their tests, so a module-scope assignment leaks into every other file in
+// the shard process (pinned by test/gstack-home-module-scope.test.ts).
+// The provenance cases rewrite CI's own variables; restore them too, or a CI
+// shard loses CI=true for every later file (qa-only-cleanup's browse daemons
+// then launch Chromium sandboxed and never become ready).
+const SCOPED_ENV = ['GSTACK_HOME', 'CI', 'GITHUB_ACTIONS', 'GITHUB_REF_NAME', 'GITHUB_SHA',
+  'CI_RUNNER', 'CI_COMMIT_REF_NAME', 'CI_COMMIT_SHORT_SHA'] as const;
+const ORIGINAL_ENV = Object.fromEntries(SCOPED_ENV.map(key => [key, process.env[key]]));
+beforeAll(() => {
+  process.env.GSTACK_HOME = TMP_HOME;
+});
+afterAll(() => {
+  for (const key of SCOPED_ENV) {
+    if (ORIGINAL_ENV[key] === undefined) delete process.env[key];
+    else process.env[key] = ORIGINAL_ENV[key];
+  }
+});
 
 describe('logBudgetOverride', () => {
   beforeEach(() => {

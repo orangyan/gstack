@@ -25,7 +25,7 @@ import { join } from "path";
 import { execFileSync, spawnSync } from "child_process";
 
 const SCRIPT = join(import.meta.dir, "..", "bin", "gstack-gbrain-sync.ts");
-const BUN_BIN = execFileSync("sh", ["-c", "command -v bun"], { encoding: "utf-8" }).trim();
+const BUN_BIN = execFileSync("sh", ["-c", "command -v bun"], { encoding: "utf-8", timeout: 30_000 }).trim();
 
 interface FakeEnv {
   tmp: string;
@@ -66,10 +66,11 @@ function makeEnv(opts: {
   if (opts.withGbrain) {
     const behavior = opts.gbrainBehavior || "ok";
     // "slow": healthy engine, cold pooler connection (#1964) — sleeps past the
-    // (test-lowered) probe timeout on `sources list`, then answers fine.
+    // (test-lowered, 300ms) probe timeout on `sources list`, then answers fine.
+    // Every call sleeps (the dream stage lists sources before its probe), so keep it short.
     const sourcesBlock =
       behavior === "slow"
-        ? `  sleep 2
+        ? `  sleep 1
   echo '{"sources":[]}'
   exit 0`
         : behavior === "ok"
@@ -112,9 +113,10 @@ function runOrchestrator(
 ): { stdout: string; stderr: string; exitCode: number } {
   // Initialize a git repo in the sandbox so repoRoot() finds it (otherwise
   // code stage skips with "not in git repo" before our check ever fires).
-  spawnSync("git", ["init", "-q", env.home], { encoding: "utf-8" });
+  spawnSync("git", ["init", "-q", env.home], { encoding: "utf-8", timeout: 30_000 });
   spawnSync("git", ["-C", env.home, "commit", "--allow-empty", "-m", "init", "-q"], {
     encoding: "utf-8",
+    timeout: 30_000,
     env: { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@t" },
   });
 
@@ -153,7 +155,7 @@ describe("gstack-gbrain-sync — split-engine SKIP (plan D12)", () => {
     } finally {
       env.cleanup();
     }
-  }, 30_000); // proceeding runs the real code-import path against the slow fake (~11s)
+  }, 30_000); // proceeding runs the real code-import path against the slow fake (~6s)
 
   it("memory stage also PROCEEDS (with warning) on probe timeout (#1964)", () => {
     const env = makeEnv({ withGbrain: true, gbrainBehavior: "slow", withConfig: true });

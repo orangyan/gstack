@@ -17,13 +17,14 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawnSync } from "child_process";
+import { gitEnv } from "./helpers/git-env";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 
 let dir: string;
 const run = (args: string[], cwd = dir): string => {
-  const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30_000, env: gitEnv() });
   if (r.status !== 0) throw new Error(`git ${args.join(" ")}\n${r.stderr}`);
   return r.stdout ?? "";
 };
@@ -146,7 +147,7 @@ describe("narrowing the range does not narrow coverage", () => {
     run(["push", "-q", "origin", "main"]);
     run(["fetch", "-q", "origin"]);
     run(["checkout", "-q", "feature"]);
-    spawnSync("git", ["merge", "--no-edit", "main"], { cwd: dir, encoding: "utf8" }); // conflicts
+    spawnSync("git", ["merge", "--no-edit", "main"], { cwd: dir, encoding: "utf8", timeout: 30_000, env: gitEnv() }); // conflicts
     writeFileSync(join(dir, "conflict.txt"), `resolved ${FAKE_AWS_RESOLV}\n`);
     run(["add", "conflict.txt"]);
     run(["commit", "-q", "--no-edit"]);
@@ -178,6 +179,7 @@ describe("S1: exclusion scoped to the push-target remote", () => {
       input: Buffer.from(stdinLines),
       encoding: "utf8",
       env: { ...process.env },
+      timeout: 30_000,
     });
     return { code: r.status ?? 0, stderr: r.stderr ?? "" };
   }
@@ -223,7 +225,7 @@ describe("S1: exclusion scoped to the push-target remote", () => {
     const head = run(["rev-parse", "HEAD"]).trim();
     const { code, stderr } = runHook(
       `refs/heads/feature ${head} refs/heads/feature ${originTip}\n`,
-      ["origin", "file:///ignored"],
+      ["origin", run(["remote", "get-url", "--push", "origin"]).trim()],
     );
     expect(code).toBe(1);
     expect(stderr).toContain("BLOCKED");
@@ -241,7 +243,7 @@ describe("S1: exclusion scoped to the push-target remote", () => {
     const head = run(["rev-parse", "HEAD"]).trim();
     const { code, stderr } = runHook(
       `refs/heads/feature ${head} refs/heads/feature ${originTip}\n`,
-      ["origin", "file:///ignored"],
+      ["origin", run(["remote", "get-url", "--push", "origin"]).trim()],
     );
     expect(stderr).not.toContain("BLOCKED");
     expect(code).toBe(0);
@@ -262,7 +264,7 @@ describe("S1: exclusion scoped to the push-target remote", () => {
     expect(code).toBe(0);
   });
 
-  test("an unconfigured name (URL push) also falls back rather than erroring", () => {
+  test("an unconfigured URL push cannot borrow another remote's published history", () => {
     const { originTip } = buildSecretOnSecondRemote();
     const head = run(["rev-parse", "HEAD"]).trim();
     const url = "file:///not-a-configured-remote";
@@ -270,7 +272,129 @@ describe("S1: exclusion scoped to the push-target remote", () => {
       `refs/heads/feature ${head} refs/heads/feature ${originTip}\n`,
       [url, url],
     );
-    expect(stderr).not.toContain("could not");
-    expect(code).toBe(0);
+    expect(stderr).toContain("aws.access_key");
+    expect(code).toBe(1);
+  });
+});
+
+// One channel per case. Blanking only the global file still loses to the
+// system file, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS, or an init.templateDir
+// copied in at git init (#2967).
+const INHERITED_HOOK = "#!/bin/sh\necho inherited-hook >&2\nexit 1\n";
+
+function writeHook(dir: string, name: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), INHERITED_HOOK, { mode: 0o755 });
+}
+
+function withInheritedEnv(extra: Record<string, string | undefined>, body: () => void): void {
+  const prev = new Map(Object.keys(extra).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    body();
+  } finally {
+    for (const [key, value] of prev) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+describe("fixture git ignores inherited hook config (#2967)", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  function keep(path: string): string {
+    roots.push(path);
+    return path;
+  }
+
+  function hooksPathConfig(): { config: string; hooks: string } {
+    const root = keep(mkdtempSync(join(tmpdir(), "gstack prepush inherited-")));
+    const hooks = join(root, "hooks");
+    writeHook(hooks, "pre-push");
+    const config = join(root, "gitconfig");
+    writeFileSync(config, `[core]\n\thooksPath = ${JSON.stringify(hooks)}\n`);
+    return { config, hooks };
+  }
+
+  function pushSeed(): void {
+    const remote = keep(mkdtempSync(join(tmpdir(), "gstack-prepush-inherited-remote-")));
+    run(["init", "-q", "--bare", "-b", "main"], remote);
+    run(["remote", "add", "origin", remote]);
+    run(["push", "-q", "origin", "main"]);
+  }
+
+  test("an inherited global hooksPath cannot reject the fixture push", () => {
+    const { config } = hooksPathConfig();
+    withInheritedEnv({ GIT_CONFIG_GLOBAL: config }, () => pushSeed());
+  });
+
+  test("an inherited system hooksPath cannot reject the fixture push", () => {
+    const { config } = hooksPathConfig();
+    withInheritedEnv({ GIT_CONFIG_SYSTEM: config, GIT_CONFIG_NOSYSTEM: undefined }, () => pushSeed());
+  });
+
+  test("GIT_CONFIG_COUNT cannot inject a rejecting hooksPath", () => {
+    const { hooks } = hooksPathConfig();
+    withInheritedEnv({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.hooksPath",
+      GIT_CONFIG_VALUE_0: hooks,
+    }, () => pushSeed());
+  });
+
+  test("GIT_CONFIG_PARAMETERS cannot inject a rejecting hooksPath", () => {
+    const { hooks } = hooksPathConfig();
+    withInheritedEnv({
+      GIT_CONFIG_PARAMETERS: `'core.hooksPath=${hooks}'`,
+    }, () => pushSeed());
+  });
+
+  test("an inherited init.templateDir cannot install a rejecting hook", () => {
+    const root = keep(mkdtempSync(join(tmpdir(), "gstack-prepush-template-")));
+    const template = join(root, "template");
+    writeHook(join(template, "hooks"), "pre-push");
+    writeHook(join(template, "hooks"), "pre-receive");
+    const config = join(root, "gitconfig");
+    writeFileSync(config, `[init]\n\ttemplateDir = ${JSON.stringify(template)}\n`);
+    const work = keep(mkdtempSync(join(tmpdir(), "gstack-prepush-template-work-")));
+    const remote = keep(mkdtempSync(join(tmpdir(), "gstack-prepush-template-remote-")));
+    withInheritedEnv({ GIT_CONFIG_GLOBAL: config }, () => {
+      run(["init", "-q", "-b", "main"], work);
+      run(["config", "user.email", "t@example.com"], work);
+      run(["config", "user.name", "T"], work);
+      writeFileSync(join(work, "README.md"), "seed\n");
+      run(["add", "README.md"], work);
+      run(["commit", "-q", "-m", "seed"], work);
+      run(["init", "-q", "--bare", "-b", "main"], remote);
+      run(["remote", "add", "origin", remote], work);
+      run(["push", "-q", "origin", "main"], work);
+    });
+  });
+
+  test("a hooksPath in the default global files under HOME or XDG_CONFIG_HOME cannot reject the fixture push", () => {
+    const { hooks } = hooksPathConfig();
+    const home = keep(mkdtempSync(join(tmpdir(), "gstack-prepush-home-")));
+    const xdg = join(home, "xdg");
+    mkdirSync(join(xdg, "git"), { recursive: true });
+    const body = `[core]\n\thooksPath = ${JSON.stringify(hooks)}\n`;
+    writeFileSync(join(home, ".gitconfig"), body);
+    writeFileSync(join(xdg, "git", "config"), body);
+    withInheritedEnv({ HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: undefined }, () => pushSeed());
+  });
+
+  test("a repo-local hooksPath still rejects the fixture push", () => {
+    const { hooks } = hooksPathConfig();
+    const remote = keep(mkdtempSync(join(tmpdir(), "gstack-prepush-local-remote-")));
+    run(["init", "-q", "--bare", "-b", "main"], remote);
+    run(["remote", "add", "origin", remote]);
+    run(["config", "core.hooksPath", hooks]);
+    expect(() => run(["push", "-q", "origin", "main"])).toThrow(/inherited-hook/);
   });
 });

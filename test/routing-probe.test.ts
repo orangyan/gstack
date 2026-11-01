@@ -8,7 +8,7 @@
  *    HAS_ROUTING: no and got nagged to create CLAUDE.md.
  *
  * 2. gstack-team-init's required-mode enforcement (the CLAUDE.md
- *    verification snippet and the generated check-gstack.sh hook) must
+ *    verification snippet and the generated check-gstack.cjs hook) must
  *    resolve the install root across GSTACK_ROOT + every host's global
  *    install location, never hardcode ~/.claude/skills/gstack. The drift
  *    test pins the probe list against the hosts registry so a new host
@@ -38,28 +38,38 @@ function makeCtx(host: 'claude' | 'codex'): TemplateContext {
   };
 }
 
-/** Extract the routing-probe block from the rendered preamble bash. */
-function extractRoutingProbe(rendered: string): string {
-  const start = rendered.indexOf('_HAS_ROUTING="no"');
+// Token-reduction Phase 1: the probe bash moved from the rendered preamble
+// into bin/gstack-skill-start (invoked by every host's preamble fence). The
+// probe block under test is extracted from the LIVE script bytes.
+const SKILL_START_SCRIPT = fs.readFileSync(
+  path.join(ROOT, 'bin', 'gstack-skill-start'),
+  'utf-8',
+);
+
+/** Extract the routing-probe block from the skill-start script. */
+function extractRoutingProbe(scriptText: string): string {
+  const start = scriptText.indexOf('_HAS_ROUTING="no"');
   expect(start).toBeGreaterThan(-1);
-  const end = rendered.indexOf('done', start);
+  const end = scriptText.indexOf('done', start);
   expect(end).toBeGreaterThan(start);
-  return rendered.slice(start, end + 'done'.length);
+  return scriptText.slice(start, end + 'done'.length);
 }
 
 describe('routing probe checks AGENTS.md too (#2500)', () => {
   for (const host of ['claude', 'codex'] as const) {
-    test(`rendered preamble probes CLAUDE.md AND AGENTS.md (${host})`, () => {
+    test(`preamble reaches the CLAUDE.md AND AGENTS.md probe (${host})`, () => {
+      // The render must invoke the script that owns the probe...
       const rendered = generatePreambleBash(makeCtx(host));
-      const probe = extractRoutingProbe(rendered);
+      expect(rendered).toContain('gstack-skill-start');
+      // ...and the probe must cover both convention files.
+      const probe = extractRoutingProbe(SKILL_START_SCRIPT);
       expect(probe).toContain('CLAUDE.md');
       expect(probe).toContain('AGENTS.md');
     });
   }
 
   test('live probe block: AGENTS.md-only repo reports HAS_ROUTING=yes', () => {
-    const rendered = generatePreambleBash(makeCtx('claude'));
-    const probe = extractRoutingProbe(rendered);
+    const probe = extractRoutingProbe(SKILL_START_SCRIPT);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-probe-'));
     try {
       fs.writeFileSync(
@@ -68,7 +78,7 @@ describe('routing probe checks AGENTS.md too (#2500)', () => {
       );
       const out = execSync(
         `bash -c '${probe.replace(/'/g, `'\\''`)}\necho "HAS_ROUTING: $_HAS_ROUTING"'`,
-        { cwd: dir, encoding: 'utf-8' },
+        { cwd: dir, encoding: 'utf-8', timeout: 30_000 },
       );
       expect(out).toContain('HAS_ROUTING: yes');
     } finally {
@@ -77,13 +87,12 @@ describe('routing probe checks AGENTS.md too (#2500)', () => {
   });
 
   test('live probe block: repo with neither file reports HAS_ROUTING=no', () => {
-    const rendered = generatePreambleBash(makeCtx('claude'));
-    const probe = extractRoutingProbe(rendered);
+    const probe = extractRoutingProbe(SKILL_START_SCRIPT);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-probe-'));
     try {
       const out = execSync(
         `bash -c '${probe.replace(/'/g, `'\\''`)}\necho "HAS_ROUTING: $_HAS_ROUTING"'`,
-        { cwd: dir, encoding: 'utf-8' },
+        { cwd: dir, encoding: 'utf-8', timeout: 30_000 },
       );
       expect(out).toContain('HAS_ROUTING: no');
     } finally {
@@ -109,8 +118,14 @@ describe('team-init resolves GSTACK_ROOT across every host (#2500)', () => {
   });
 
   test('generated hook blocks only when NO install root resolves', () => {
-    // The hook's block branch must gate on the resolved root being empty,
-    // not on any single hardcoded directory.
-    expect(teamInit).toContain('if [ -z "$_GSTACK_ROOT" ]; then');
+    // The hook (CommonJS, so it runs under any hook shell) probes GSTACK_ROOT
+    // and every host's global root, and its block branch gates on none
+    // resolving, not on any single hardcoded directory.
+    const hook = teamInit.slice(teamInit.indexOf("cat > \"$HOOKS_DIR/check-gstack.cjs\""), teamInit.indexOf('\nHOOK_EOF\n'));
+    expect(hook).toContain('process.env.GSTACK_ROOT');
+    for (const config of ALL_HOST_CONFIGS) expect(hook).toContain(`'${config.globalRoot}'`);
+    expect(hook).toContain("'.gstack/repos/gstack'");
+    expect(hook).toContain('const gstackRoot = roots.find(');
+    expect(hook).toContain('if (gstackRoot) {');
   });
 });

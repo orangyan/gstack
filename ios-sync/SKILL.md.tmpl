@@ -1,6 +1,6 @@
 ---
 name: ios-sync
-preamble-tier: 3
+preamble-tier: 2
 version: 1.0.0
 description: |
   Regenerate the iOS debug bridge against the latest upstream gstack
@@ -41,8 +41,7 @@ This skill regenerates the relevant artifacts in place.
 
 **Templates live in upstream gstack.** The installed
 `gstack-ios-qa-regen` launcher resolves its own gstack root and copies only
-the supported bridge files from `ios-qa/templates/`. The fork's HTTP-fetch
-and wildcard-copy patterns are gone.
+the supported bridge files from `ios-qa/templates/`.
 
 ## Phase 1: Detect installed version
 

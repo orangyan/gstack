@@ -137,7 +137,7 @@ describe('gstack-slug — outermost project-root resolution', () => {
 
     // The cache file itself must have been overwritten (self-healing).
     const cachedAfter = fs.readFileSync(cacheFile, 'utf8').trim();
-    expect(cachedAfter).toBe('loadout');
+    expect(cachedAfter).toBe('v2:loadout');
   });
 
   // AC-3: no regression — cwd IS the project root.
@@ -172,12 +172,13 @@ describe('gstack-slug — outermost project-root resolution', () => {
     // succeeds. (The script's step 2 reads the remote when there's no cache.)
     const gitInit = spawnSync('git', ['init', '-q', '-b', 'main', projectRoot], {
       encoding: 'utf8',
+      timeout: 30_000,
     });
     expect(gitInit.status).toBe(0);
     const gitRemote = spawnSync(
       'git',
       ['-C', projectRoot, 'remote', 'add', 'origin', 'https://github.com/foo/bar.git'],
-      { encoding: 'utf8' },
+      { encoding: 'utf8', timeout: 30_000 },
     );
     expect(gitRemote.status).toBe(0);
 
@@ -212,7 +213,7 @@ describe('gstack-slug — outermost project-root resolution', () => {
     expect(result.status).toBe(0);
 
     // Target key got self-healed.
-    expect(fs.readFileSync(path.join(cacheDir, targetKey), 'utf8').trim()).toBe('loadout');
+    expect(fs.readFileSync(path.join(cacheDir, targetKey), 'utf8').trim()).toBe('v2:loadout');
     // Unrelated key is untouched.
     expect(fs.readFileSync(unrelatedFile, 'utf8').trim()).toBe('unrelated-value-must-survive');
   });

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * PostToolUse hook for AskUserQuestion — runtime reliability layer for the
  * AUQ-failure prose fallback (OV3:B).
@@ -30,8 +30,9 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { runBin } from './spawn-bin';
+import { SPAWNED_CONSENT_RULE, SPAWNED_ESCAPE_SENTENCE } from './spawned-directive';
+import { logHookError as sharedLogHookError } from './hook-log';
 
 interface HookStdin {
   tool_name?: string;
@@ -39,25 +40,8 @@ interface HookStdin {
   cwd?: string;
 }
 
-function stateRoot(): string {
-  return (
-    process.env.GSTACK_STATE_ROOT ||
-    process.env.GSTACK_HOME ||
-    path.join(os.homedir(), '.gstack')
-  );
-}
-
 function logHookError(msg: string): void {
-  try {
-    const sr = stateRoot();
-    fs.mkdirSync(sr, { recursive: true });
-    fs.appendFileSync(
-      path.join(sr, 'hook-errors.log'),
-      `${new Date().toISOString()} auq-error-fallback-hook: ${msg}\n`,
-    );
-  } catch {
-    // last-resort swallow
-  }
+  sharedLogHookError('auq-error-fallback-hook', msg);
 }
 
 function readStdin(): Promise<string> {
@@ -124,15 +108,17 @@ export function isErrorResponse(response: unknown): boolean {
 
 /** Resolve SESSION_KIND via the shared helper (same classification the preamble
  *  echoes). Falls back to 'interactive' (degrade-safe) on any failure. */
-export function sessionKind(cwd?: string): 'spawned' | 'headless' | 'interactive' {
+export type SessionKind = 'spawned' | 'headless' | 'interactive' | 'unattended';
+
+export function sessionKind(cwd?: string): SessionKind {
   try {
     const res = runBin('gstack-session-kind', [], {
       encoding: 'utf-8',
       timeout: 3000,
       cwd: cwd && fs.existsSync(cwd) ? cwd : undefined,
     });
-    const out = (res.stdout || '').trim();
-    if (out === 'spawned' || out === 'headless' || out === 'interactive') return out;
+    const out = String(res.stdout || '').trim();
+    if (out === 'spawned' || out === 'headless' || out === 'interactive' || out === 'unattended') return out;
   } catch (e) {
     logHookError(`sessionKind failed: ${(e as Error).message}`);
   }
@@ -140,30 +126,62 @@ export function sessionKind(cwd?: string): 'spawned' | 'headless' | 'interactive
 }
 
 /** The directive injected per session kind. Exported for unit testing. */
-export function directiveFor(kind: 'spawned' | 'headless' | 'interactive'): string {
+export function directiveFor(kind: SessionKind): string {
   const lead =
     'The AskUserQuestion call did not return a usable answer (error / missing result). ' +
     'Per the AskUserQuestion failure-fallback rule: ';
   switch (kind) {
     case 'spawned':
+      // Self-contained carve-out (#2733 review): the "Spawned session block"
+      // exists in context only when a gstack preamble ran; an AUQ error
+      // outside a skill must still carry the destructive exception here.
       return (
         lead +
         'SESSION_KIND=spawned — auto-choose the recommended option per the Spawned session block. ' +
-        'Do not emit prose, do not BLOCK.'
+        'Do not emit prose, do not BLOCK. Exception: never auto-choose a destructive or ' +
+        'irreversible option — take the conservative non-destructive choice (skip/defer), ' +
+        'record it, and continue.' + SPAWNED_CONSENT_RULE
       );
-    case 'headless':
+    case 'unattended':
+      // Plan B1 (decision D6): a parent agent reads this run's artifacts and
+      // nobody answers mid-run. Recommended options are taken and logged;
+      // anything without a recommendation, a consent, a destructive option or
+      // an approval gate is a pending gate item, never an approval.
       return (
         lead +
-        'SESSION_KIND=headless — report `BLOCKED — AskUserQuestion unavailable` and stop; no human can answer.'
+        'SESSION_KIND=unattended — auto-choose the `(recommended)` option and append it to decisions.jsonl ' +
+        'with kind "auto"; do not emit prose, do not BLOCK. A question with no recommendation, a consent, ' +
+        'a destructive or irreversible option, or an approval gate is appended with kind "approval" and status ' +
+        '"pending" — never chosen, never approved — and the skill ends at its next gate. Only /autoplan and ' +
+        '/eval-plan print `GSTACK_RESULT: skill=<name> status=gate_pending run=<dir>` there, and /ship prints its ' +
+        'own line at Step 22 (`gstack-ship-receipt result`); every other skill prints no GSTACK_RESULT line of its own ' +
+        '(only a refused install check prints `status=refused run=-` for any skill), so do not invent one ' +
+        '(docs/unattended.md names each skill\'s record).'
+      );
+    case 'headless':
+      // #2733 review (multi-specialist): a spawned-marked subagent under a
+      // HEADLESS-classified parent env (CI/eval-hosted /ship) hits this branch
+      // — the shell-out sees the harness env, never the per-command marker.
+      // The self-gating escape sentence keeps the JSON contract alive there;
+      // plain headless sessions read its condition as false and still BLOCK.
+      return (
+        lead +
+        'SESSION_KIND=headless — report `BLOCKED — AskUserQuestion unavailable` and stop; no human can answer. ' +
+        SPAWNED_ESCAPE_SENTENCE
       );
     case 'interactive':
     default:
+      // #2733: the shell-out above runs in the HARNESS env, so a subagent
+      // marked spawned via a per-command env prefix still classifies as
+      // interactive here — the escape sentence is the only lever for that
+      // topology (see spawned-directive.ts).
       return (
         lead +
         'SESSION_KIND=interactive — render the decision as a PROSE message now: a clear ELI10 of the issue, ' +
         'then a Recommendation line, then ONE paragraph per choice carrying its `(recommended)` marker, its ' +
         '`Completeness: X/10`, and 2-4 sentences of reasoning. Tell the user to reply with a letter, then STOP. ' +
-        '(Retry the call once first only if no answer could have surfaced.)'
+        '(Retry the call once first only if no answer could have surfaced.) ' +
+        SPAWNED_ESCAPE_SENTENCE
       );
   }
 }

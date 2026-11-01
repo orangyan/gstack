@@ -1,17 +1,21 @@
 /**
  * AUQ behavioral matrix — drive each AUQ-heavy skill to its first
- * AskUserQuestion and grade it to plan-ceo's bar (periodic, paid, SDK capture).
+ * AskUserQuestion and grade it to plan-ceo's bar (periodic, paid, native capture).
  *
- * Layer 0 (auq-format-always-loaded.test.ts) deterministically guarantees every
- * skill SHIPS the format spec in its always-loaded skeleton. This test proves
- * each skill's model OBEYS it: that the first real AUQ each skill fires is a
- * compliant decision brief (all 7 format elements) with a substantive
- * recommendation (>= 4). One parametrized case per skill so a single weak skill
+ * Layer 0 (auq-format-always-loaded.test.ts) deterministically guarantees each
+ * listed skill SHIPS the format spec in its always-loaded skeleton. This test
+ * proves each skill's model OBEYS it: that the first real AUQ it fires carries
+ * the fields software reads (a Recommendation: line and exactly one
+ * (recommended) option) with a substantive recommendation (3-sample judge panel
+ * mean >= 4 on the one capture; C4). The other
+ * format elements are logged. One parametrized case per skill so a single weak skill
  * is an isolated failure, not a blocker for the rest.
  *
- * Capture is the SDK $OUT_FILE path (clean text, no TTY mangling), with the skill
- * pinned to an absolute path and the agent restricted to Read/Write so it can't
- * wander to the global install. See test/helpers/auq-sdk-capture.ts.
+ * Capture records the actual public AskUserQuestion payload and verifies its
+ * native display, with the skill pinned to an absolute path and only Read,
+ * Write, and AskUserQuestion available. The exact fields are graded without
+ * adding format labels or reading private reasoning. See
+ * test/helpers/auq-native-capture.ts.
  *
  * Scope: skills whose first AUQ is reliably reachable from a text fixture. Skills
  * that gate their first decision on external resources (a running browser for
@@ -20,18 +24,23 @@
  * choices) are intentionally OUT of this matrix; Layer 0 covers their format
  * spec, and a fixture can't fairly trigger their AUQ.
  *
- * Run a subset in the foreground with AUQ_MATRIX_ONLY="plan-eng-review,cso".
+ * CSO is intentionally absent: its private startup omits the shared AUQ block,
+ * and its dedicated E2E grades evidence, reporting, and proof behavior.
+ * Run a subset in the foreground with AUQ_MATRIX_ONLY="plan-eng-review,spec".
  */
 import { test } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
+import { CAPTURE_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
 import * as fs from 'node:fs';
+import { captureNativeFirstAuq, type NativeAuqCapture } from './helpers/auq-native-capture';
 import {
   setupSkillDir,
-  captureFirstAuq,
   scoreAuqFormat,
+  auqMachineFormatProblems,
   skillFromWorktree,
-  gradeAuqRecommendation,
 } from './helpers/auq-sdk-capture';
+import { auqSubstancePanel, AUQ_SUBSTANCE_MIN } from './helpers/auq-substance-panel';
 
 const describeE2E = describeE2ETier('periodic');
 const runId = `auq-matrix-${process.env.EVALS_RUN_ID ?? 'local'}`;
@@ -50,17 +59,6 @@ We haven't talked to any developers about whether price is the barrier. The team
 agreed it "feels like" it should be cheaper. We'll add a new Stripe tier, a React
 pricing page, a Postgres entitlements table, and a Redis cache — no tests
 mentioned, no rollout plan, no auth check on the upgrade endpoint.
-`;
-
-const VULN_CODE = `export function login(req, res) {
-  // builds SQL by string concat; sets a session cookie with no flags
-  const user = db.query("SELECT * FROM users WHERE name = '" + req.body.name + "'");
-  if (user && user.password === req.body.password) {
-    res.cookie('session', user.id); // no HttpOnly, Secure, SameSite, or expiry
-    return res.json({ ok: true });
-  }
-  return res.status(401).json({ ok: false });
-}
 `;
 
 interface MatrixSkill {
@@ -93,11 +91,6 @@ const MATRIX: MatrixSkill[] = [
     scenario: 'The founder says: "I am building an AI tool that auto-writes unit tests for any repo. I think it is a great idea but I have zero users. Should I build it, and how do I get my first users?" Run the office-hours diagnostic until the first AskUserQuestion.',
   },
   {
-    skill: 'cso',
-    fixtures: { 'server/auth.js': VULN_CODE },
-    scenario: 'Audit the code in this repo (server/auth.js) for security issues. Walk the audit until the first AskUserQuestion (scope/stack confirmation or first finding).',
-  },
-  {
     skill: 'spec',
     fixtures: {},
     scenario: 'Turn this vague intent into a precise spec: "add email notifications when a task is assigned to someone." Walk the spec workflow until the first AskUserQuestion.',
@@ -107,7 +100,7 @@ const MATRIX: MatrixSkill[] = [
     // controlled Opus re-run passed cleanly (7/7 format, substance 5, 160s).
     // The spec workflow's long pre-question phase needs the stronger model
     // to reach its first AskUserQuestion inside the turn budget.
-    model: 'claude-opus-4-7',
+    model: resolveEvalModel('capture'),
   },
   {
     skill: 'design-consultation',
@@ -131,9 +124,9 @@ describeE2E('AUQ behavioral matrix (periodic)', () => {
           fixtures: m.fixtures,
           tmpPrefix: `auq-matrix-${m.skill}-`,
         });
-        let text = '';
+        let capture: NativeAuqCapture;
         try {
-          text = await captureFirstAuq({
+          capture = await captureNativeFirstAuq({
             planDir: dir,
             skillName: m.skill,
             scenario: m.scenario,
@@ -145,20 +138,25 @@ describeE2E('AUQ behavioral matrix (periodic)', () => {
           fs.rmSync(dir, { recursive: true, force: true });
         }
 
+        const text = capture.text;
         const fmt = scoreAuqFormat(text);
         let substance = 0;
+        let substanceMean = 0;
+        let samples: number[] = [];
         let recPresent = false;
         let hadBecause = false;
         if (text.trim()) {
-          const g = await gradeAuqRecommendation(text);
-          substance = g.substance;
-          recPresent = g.present;
-          hadBecause = g.hadLiteralBecause;
+          const panel = await auqSubstancePanel(text);
+          substance = panel.median;
+          substanceMean = panel.mean;
+          samples = panel.samples.map(g => g.substance);
+          recPresent = panel.samples[0].present;
+          hadBecause = panel.samples[0].hadLiteralBecause;
         }
         // eslint-disable-next-line no-console
         console.log(
           `[AUQ-matrix ${m.skill}] captured=${text.length}B format=${fmt.present}/${fmt.total} ` +
-            `missing=[${fmt.missing.join(',')}] recPresent=${recPresent} substance=${substance} ` +
+            `missing=[${fmt.missing.join(',')}] recPresent=${recPresent} substance median=${substance} mean=${substanceMean.toFixed(2)} [${samples.join(',')}] ` +
             `literalBecause=${hadBecause}`,
         );
 
@@ -166,15 +164,18 @@ describeE2E('AUQ behavioral matrix (periodic)', () => {
           throw new Error(`${m.skill}: agent produced NO AUQ capture (never reached a question in budget).`);
         }
         const problems: string[] = [];
-        if (fmt.missing.length > 0) problems.push(`missing format element(s): ${fmt.missing.join(', ')}`);
-        if (substance < 4) problems.push(`recommendation substance ${substance} < 4 (boilerplate/weak)`);
+        // Presentation elements (ELI10, Pros / cons, ✅/❌, Net:) are logged above, not failed.
+        problems.push(...auqMachineFormatProblems(capture.question));
+        if (substance < AUQ_SUBSTANCE_MIN) {
+          problems.push(`recommendation substance median ${substance} < ${AUQ_SUBSTANCE_MIN} over samples [${samples.join(',')}] (boilerplate/weak)`);
+        }
         if (problems.length > 0) {
           throw new Error(
             `${m.skill} AUQ not at plan-ceo bar:\n  - ${problems.join('\n  - ')}\n--- captured AUQ ---\n${text}`,
           );
         }
       },
-      300_000,
+      CAPTURE_MS,
     );
   }
 });

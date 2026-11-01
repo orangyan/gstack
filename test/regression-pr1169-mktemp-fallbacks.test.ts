@@ -56,6 +56,77 @@ describe("PR #1169 bug #4: gstack-telemetry-sync mktemp fallback", () => {
   });
 });
 
+// #2679: three skill-content mktemp sites ran unguarded. An empty result
+// ("" on mktemp failure) silently disabled the redaction pass (redact-doc
+// resolver + ship pr-body) and — the destructive one — made /gstack-upgrade's
+// vendored path clone to "/gstack", fail the swap, then `rm -rf` BOTH the
+// live install's backup and "". Guards must abort loudly; the upgrade block
+// must also restore the backup when the swap fails (same failure class:
+// backup deletion after a failed mv).
+describe("#2679: skill-content mktemp guards", () => {
+  test("the shared free-text block guards each mktemp with a loud exit (it creates /spec's REDACT_FILE)", () => {
+    // CEO-12 moved REDACT_FILE's creation from the redact-doc resolver into the
+    // shared free-text block (scripts/resolvers/free-text-file.ts).
+    const body = readScript("scripts/resolvers/free-text-file.ts");
+    expect(body).toMatch(/=\$\(mktemp "\\\$\{_GT:\?\}\/\$\{f\.stem\}\.XXXXXX"\) \|\| \{ echo "Not sent: [^"]*" >&2; exit 1; \}/);
+    const rendered = readScript("spec/sections/gate-and-file.md");
+    expect(rendered).toMatch(/REDACT_FILE=\$\(mktemp "\$\{_GT:\?\}\/spec\.XXXXXX"\)\s*\|\|\s*\{[^}]*exit 1/);
+  });
+
+  test("ship pr-body template guards PR_BODY_FILE=$(mktemp ...) with a loud exit", () => {
+    const body = readScript("ship/sections/pr-body.md.tmpl");
+    // G3 (#2952): the mktemp now carries a ${TMPDIR:-/tmp} template.
+    expect(body).toMatch(/PR_BODY_FILE=\$\(mktemp "\$\{TMPDIR:-\/tmp\}\/[^"]+"\)\s*\|\|\s*\{[^}]*exit 1/);
+  });
+
+  test("ship pr-body GitLab path sends the SCANNED file through gstack-post, never a re-rendered heredoc", () => {
+    const body = readScript("ship/sections/pr-body.md.tmpl");
+    expect(body).toContain('gstack-post pr-create --base <base> --title-file "$TITLE_FILE" --body-file "${PR_BODY_FILE:?restore the composed body path}"');
+    expect(body).not.toMatch(/glab mr (?:create|update)/);
+    expect(body).not.toMatch(/cat <<'EOF'/);
+  });
+
+  test("gstack-upgrade vendored block guards mktemp -d and clone with loud aborts", () => {
+    const body = readScript("gstack-upgrade/SKILL.md.tmpl");
+    expect(body).toMatch(/TMP_DIR=\$\(mktemp -d "\$\{TMPDIR:-\/tmp\}\/[^"]+"\)\s*\|\|\s*\{[^}]*exit 1/);
+    expect(body).toMatch(/git clone[^\n]*\|\|\s*\{[^}]*exit 1/);
+  });
+
+  test("gstack-upgrade vendored block restores the backup on a failed swap (no unconditional backup rm)", () => {
+    const body = readScript("gstack-upgrade/SKILL.md.tmpl");
+    expect(body).toMatch(/if mv "\$TMP_DIR\/gstack" "\$INSTALL_DIR"; then/);
+    expect(body).toMatch(/mv "\$INSTALL_DIR\.bak" "\$INSTALL_DIR"/);
+    // The backup rm must live inside the success branch, not after the block.
+    const block = body.slice(body.indexOf('if mv "$TMP_DIR/gstack"'));
+    const successRm = block.indexOf('rm -rf "$INSTALL_DIR.bak"');
+    const elseBranch = block.indexOf("else");
+    expect(successRm).toBeGreaterThan(-1);
+    expect(successRm).toBeLessThan(elseBranch);
+  });
+
+  test("runtime: the guarded assignment aborts when mktemp fails", () => {
+    const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+    const script = `mktemp() { return 1; }
+TMP_DIR=$(mktemp -d) || { echo "ERROR: mktemp failed — aborting upgrade (install untouched)." >&2; exit 1; }
+echo "SHOULD NOT REACH: $TMP_DIR"`;
+    const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", timeout: 10_000 });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("mktemp failed");
+    expect(r.stdout).not.toContain("SHOULD NOT REACH");
+  });
+
+  test("runtime: gstack-redact --from-file '' errors loudly instead of falling through to stdin", () => {
+    const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+    const r = spawnSync(
+      "bun",
+      [path.join(ROOT, "bin", "gstack-redact"), "--from-file", "", "--json"],
+      { encoding: "utf-8", input: "placeholder stdin content (never read on the error path)", timeout: 15_000 },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("non-empty path");
+  });
+});
+
 describe("PR #1169 bug #5: supabase/verify-rls.sh mktemp fallback", () => {
   const SCRIPT = "supabase/verify-rls.sh";
 
@@ -79,4 +150,33 @@ describe("PR #1169 bug #5: supabase/verify-rls.sh mktemp fallback", () => {
     );
     expect(guard).not.toBeNull();
   });
+});
+
+// G3 (#2952): bare `mktemp`, `mktemp -t` and literal `/tmp/` templates ignore
+// the TMPDIR a sandboxed agent shell sets, and a failed mktemp under `set -e`
+// silently dropped the learning or question being logged.
+describe("G3: mktemp honors TMPDIR in logging bins and lane-owned skill bash", () => {
+  const FILES = [
+    "bin/gstack-learnings-log",
+    "bin/gstack-question-log",
+    "bin/gstack-question-preference",
+    "bin/gstack-jsonl-merge",
+    "bin/gstack-distill-free-text",
+    "bin/gstack-community-dashboard",
+    "bin/gstack-security-dashboard",
+    "ship/sections/pr-body.md.tmpl",
+    "document-release/sections/release-body.md.tmpl",
+  ];
+  for (const rel of FILES) {
+    test(`${rel}: every temp-dir mktemp uses a \${TMPDIR:-/tmp} template`, () => {
+      const calls = [...readScript(rel).matchAll(/(?:\$\(|^[ \t]*)(mktemp\b[^\n)]*)/gm)].map((m) => m[1]);
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        expect(call).not.toMatch(/^mktemp\s*$/);
+        expect(call).not.toMatch(/^mktemp\s+(-d\s+)?-t\b/);
+        expect(call).not.toMatch(/^mktemp\s+(-d\s+)?["']?\/tmp\//);
+        expect(call).toMatch(/\$\{TMPDIR:-\/tmp\}\//);
+      }
+    });
+  }
 });

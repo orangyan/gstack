@@ -24,6 +24,11 @@
  * Timeout → probe exceeded GSTACK_GBRAIN_PROBE_TIMEOUT_MS (default 15s) with no
  *           recognized error — engine is likely healthy but slow (e.g. a cold
  *           pooler connection, #1964). Consumers treat this as usable.
+ * Db-unreachable → the probe failed with a network error (DNS failure such as
+ *           ENOTFOUND/EAI_AGAIN in an offline sandbox, a refused or timed-out
+ *           connection). The config is fine as far as we know; it must never
+ *           route users to Step 1.5's "move your config aside" remediation.
+ *           Local stages skip; skill rendering treats it like timeout.
  * Thin-client → config carries gbrain's remote_mcp marker (#2051), OR the
  *           agent host's MCP registration is remote-HTTP-only (#2520 — bearer
  *           installs via `gbrain connect --token` never get the marker): NO
@@ -48,7 +53,8 @@ import {
 import { atomicWriteSync } from "./fs-atomic";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { buildGbrainEnv, gbrainConfigDir, NEEDS_SHELL_ON_WINDOWS } from "./gbrain-exec";
+import { buildGbrainEnv, gbrainChildCwd, gbrainConfigDir, isExecTimeout, NEEDS_SHELL_ON_WINDOWS } from "./gbrain-exec";
+import { resolveStateRoot } from "./state-root";
 
 export type LocalEngineStatus =
   | "ok"
@@ -58,6 +64,7 @@ export type LocalEngineStatus =
   | "broken-db"
   | "engine-locked"
   | "timeout"
+  | "db-unreachable"
   | "thin-client";
 
 export interface ClassifyOptions {
@@ -76,6 +83,8 @@ interface CacheEntry {
   // future shape change here requires an explicit migration.
   schema_version: 1;
   status: LocalEngineStatus;
+  /** One-line reason for a db-unreachable status (code + host). */
+  detail?: string;
   cached_at: number;
   /** Cache invariants — entry is invalidated if any of these change between writes. */
   key: {
@@ -116,10 +125,7 @@ function userHome(env?: NodeJS.ProcessEnv): string {
 
 /** Cache path computed fresh on each call so tests can mutate GSTACK_HOME per case. */
 export function cacheFilePath(): string {
-  return join(
-    process.env.GSTACK_HOME || join(userHome(), ".gstack"),
-    ".gbrain-local-status-cache.json",
-  );
+  return join(resolveStateRoot(), ".gbrain-local-status-cache.json");
 }
 
 /**
@@ -146,9 +152,9 @@ function gbrainConfigPath(env?: NodeJS.ProcessEnv): string {
  * cwd's NEAREST-ANCESTOR project scope only (#2499 made project scope
  * visible; the per-project scoping fixes the machine-wide bleed where ONE
  * project's remote registration reclassified broken local engines as
- * thin-client for EVERY cwd). Ancestor matching mirrors the
- * GBRAIN_MCP_ENTRY_JQ resolution in
- * scripts/resolvers/preamble/generate-brain-sync-block.ts: cwd == key or
+ * thin-client for EVERY cwd). Ancestor matching mirrors the inline jq
+ * resolution in bin/gstack-skill-start (the single bash copy of the #2499
+ * resolution, moved there in token-reduction Phase 1): cwd == key or
  * cwd startswith key + separator, longest matching key that actually
  * carries a gbrain entry wins (a nested project WITHOUT gbrain doesn't
  * shadow its parent's registration).
@@ -259,30 +265,56 @@ function hashPath(p: string): string {
  * Memoized per-process keyed on PATH so detect's call and the classifier's
  * call share one fork-exec (~200ms saved per skill preamble).
  */
-const _gbrainBinCache = new Map<string, string | null>();
+// #2716: the probe must tell "gbrain isn't installed" apart from "gbrain is
+// installed but the --version round trip blew the budget" (bun-shim installs
+// on a loaded POSIX box take >2s). Both used to collapse into `null` → the
+// classifier said `no-cli`, which the `--is-ok` whitelist does NOT forgive —
+// so a slow box silently lost every brain-aware block. The cache stores the
+// discriminated result (per-process, same lifetime the old null had).
+export interface GbrainBinProbe {
+  bin: string | null;
+  timedOut: boolean;
+}
+// Caching a TIMEOUT for process lifetime is deliberate: the memo exists to
+// dedupe the ~3 probes a single skill preamble fires, and preamble processes
+// are short-lived — a retry next invocation gets a fresh probe anyway.
+const _gbrainBinCache = new Map<string, GbrainBinProbe>();
 // On Windows the shim is `gbrain.cmd` → `bun run cli.ts`; a cold spawn can
 // exceed 2s, and a false negative here poisons the 60s status cache with
 // "no-cli". Give the shim headroom; POSIX keeps the tight timeout.
+// `GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS` overrides for tests (same
+// precedent as GSTACK_GBRAIN_PROBE_TIMEOUT_MS on the sources probe).
 const VERSION_PROBE_TIMEOUT_MS = NEEDS_SHELL_ON_WINDOWS ? 10_000 : 2_000;
-export function resolveGbrainBin(env?: NodeJS.ProcessEnv): string | null {
+function versionProbeTimeoutMs(env?: NodeJS.ProcessEnv): number {
+  const raw = (env ?? process.env).GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS;
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : VERSION_PROBE_TIMEOUT_MS;
+}
+export function probeGbrainBin(env?: NodeJS.ProcessEnv): GbrainBinProbe {
   const e = env ?? process.env;
   const key = e.PATH || "";
   if (_gbrainBinCache.has(key)) return _gbrainBinCache.get(key)!;
-  let result: string | null = null;
+  let result: GbrainBinProbe = { bin: null, timedOut: false };
   try {
     execFileSync("gbrain", ["--version"], {
       encoding: "utf-8",
-      timeout: VERSION_PROBE_TIMEOUT_MS,
+      timeout: versionProbeTimeoutMs(e),
       stdio: ["ignore", "ignore", "ignore"],
       env: e,
       shell: NEEDS_SHELL_ON_WINDOWS, // #1731: gbrain is a .cmd shim on Windows
     });
-    result = "gbrain";
-  } catch {
-    result = null;
+    result = { bin: "gbrain", timedOut: false };
+  } catch (err) {
+    // Same discrimination the `sources list` probe below already uses: a
+    // killed/expired spawn is a TIMEOUT (binary present but slow), anything
+    // else (ENOENT, non-zero exit) is genuinely no CLI.
+    result = { bin: null, timedOut: isExecTimeout(err) };
   }
   _gbrainBinCache.set(key, result);
   return result;
+}
+export function resolveGbrainBin(env?: NodeJS.ProcessEnv): string | null {
+  return probeGbrainBin(env).bin;
 }
 
 /** Memoized per-process. */
@@ -295,7 +327,7 @@ export function readGbrainVersion(env?: NodeJS.ProcessEnv): string {
   try {
     const out = execFileSync("gbrain", ["--version"], {
       encoding: "utf-8",
-      timeout: VERSION_PROBE_TIMEOUT_MS,
+      timeout: versionProbeTimeoutMs(e),
       stdio: ["ignore", "pipe", "ignore"],
       env: e,
       shell: NEEDS_SHELL_ON_WINDOWS, // #1731: gbrain is a .cmd shim on Windows
@@ -349,23 +381,24 @@ function keysEqual(a: CacheEntry["key"], b: CacheEntry["key"]): boolean {
   );
 }
 
-function readCache(key: CacheEntry["key"]): LocalEngineStatus | null {
+function readCache(key: CacheEntry["key"]): CacheEntry | null {
   if (!existsSync(cacheFilePath())) return null;
   try {
     const raw = JSON.parse(readFileSync(cacheFilePath(), "utf-8")) as CacheEntry;
     if (raw.schema_version !== 1) return null;
     if (Date.now() - raw.cached_at > CACHE_TTL_MS) return null;
     if (!keysEqual(raw.key, key)) return null;
-    return raw.status;
+    return raw;
   } catch {
     return null;
   }
 }
 
-function writeCache(status: LocalEngineStatus, key: CacheEntry["key"]): void {
+function writeCache(status: LocalEngineStatus, key: CacheEntry["key"], detail?: string): void {
   const entry: CacheEntry = {
     schema_version: 1,
     status,
+    ...(detail ? { detail } : {}),
     cached_at: Date.now(),
     key,
   };
@@ -377,6 +410,38 @@ function writeCache(status: LocalEngineStatus, key: CacheEntry["key"]): void {
   }
 }
 
+const NETWORK_ERROR_RE = /\b(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ECONNRESET)\b/;
+
+/**
+ * The one-line db-unreachable reason (A2). The host comes from the configured
+ * database_url when it parses (never the password), else from the error text.
+ */
+export function dbUnreachableReason(code: string, host: string): string {
+  return `database host unreachable (${code}${host ? ` ${host}` : ""}); your gbrain config is unchanged. ` +
+    "Fix: check network or VPN, then re-run /sync-gbrain.";
+}
+
+function networkFailureDetail(stderr: string, env?: NodeJS.ProcessEnv): string | null {
+  const m = stderr.match(NETWORK_ERROR_RE);
+  if (!m) return null;
+  let host = "";
+  try {
+    const cfg = JSON.parse(readFileSync(join(gbrainConfigDir(env ?? process.env), "config.json"), "utf-8"));
+    if (typeof cfg?.database_url === "string") {
+      host = new URL(cfg.database_url.replace(/^postgres(ql)?:\/\//, "http://")).hostname;
+    }
+  } catch {}
+  if (!host) host = stderr.match(new RegExp(`${m[1]}\\s+([A-Za-z0-9.-]+)`))?.[1] ?? "";
+  return dbUnreachableReason(m[1], host);
+}
+
+let lastDetail: string | null = null;
+
+/** The reason recorded with the last db-unreachable classification, if any. */
+export function localEngineStatusDetail(): string | null {
+  return lastDetail;
+}
+
 /**
  * Probe via `gbrain sources list --json`. Classify the outcome.
  *
@@ -385,9 +450,12 @@ function writeCache(status: LocalEngineStatus, key: CacheEntry["key"]): void {
  * error messages, classifier returns broken-config defensively (codex #8).
  */
 function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
-  // 1. CLI on PATH?
-  const gbrainBin = resolveGbrainBin(env);
-  if (!gbrainBin) return "no-cli";
+  // 1. CLI on PATH? A probe that TIMED OUT means the binary exists but the
+  // box is slow (#2716: bun-shim installs) — that's "timeout", which the
+  // `--is-ok` whitelist forgives, never "no-cli", which it doesn't.
+  const probe = probeGbrainBin(env);
+  if (!probe.bin) return probe.timedOut ? "timeout" : "no-cli";
+  const gbrainBin = probe.bin;
 
   // 2. Config file present? A bearer thin client (#2520) may never have run
   // a local init, so config.json can be absent while the remote-HTTP MCP
@@ -431,11 +499,13 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
       timeout: probeTimeoutMs(env),
       stdio: ["ignore", "pipe", "pipe"],
       env: buildGbrainEnv({ baseEnv: env ?? process.env }),
+      cwd: gbrainChildCwd(undefined, env ?? process.env),
       shell: NEEDS_SHELL_ON_WINDOWS, // #1731: gbrain is a .cmd shim on Windows
     });
     return "ok";
   } catch (err) {
     const e = err as NodeJS.ErrnoException & {
+      stdout?: Buffer | string;
       stderr?: Buffer | string;
       killed?: boolean;
       signal?: NodeJS.Signals | null;
@@ -453,8 +523,21 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
     // DB-unreachable signal.
     const raw = ((): LocalEngineStatus => {
       if (/thin[- ]client/i.test(stderr)) return "thin-client";
+      const network = networkFailureDetail(stderr, env);
+      if (network) {
+        lastDetail = network;
+        return "db-unreachable";
+      }
       if (stderr.includes("Cannot connect to database")) return "broken-db";
       if (stderr.includes("config.json")) return "broken-config";
+
+      let structuredBusy = false;
+      try {
+        structuredBusy = JSON.parse(e.stdout?.toString() || "")?.error === "pglite_busy";
+      } catch {}
+      if (structuredBusy) {
+        return configuredEngine(env) === "pglite" ? "engine-locked" : "broken-db";
+      }
 
       // PGLite is single-process. A long-lived `gbrain serve` can own the
       // embedded database, causing the CLI to finish with its own exit 124 and
@@ -464,10 +547,21 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
         return configuredEngine(env) === "pglite" ? "engine-locked" : "broken-db";
       }
 
+      // gbrain >= 0.43 refuses the same held-lock case with exit 1 and its
+      // own message: "GBrain's local database is already open through `gbrain
+      // serve` (MCP, PID N). This brain uses PGLite, ...". That string matches
+      // none of the branches above, so without this check it falls through to
+      // the defensive broken-config default — whose remediation tells the user
+      // to move a perfectly healthy config.json aside and re-init the engine
+      // (#2194 follow-up).
+      if (stderr.includes("already open through")) {
+        return configuredEngine(env) === "pglite" ? "engine-locked" : "broken-db";
+      }
+
       // Probe killed by the timeout with no recognized error: the engine is
       // most likely healthy but slow (cold pooler connections measured at
       // 6.9-10.7s in #1964). Don't tell the user their config is malformed.
-      if (e.killed === true || e.signal === "SIGTERM" || e.code === "ETIMEDOUT") {
+      if (isExecTimeout(e)) {
         return "timeout";
       }
 
@@ -484,7 +578,7 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
     // to do locally" message. "timeout" is deliberately excluded: it already
     // counts as usable and may be a genuinely healthy slow LOCAL engine.
     if (
-      (raw === "broken-db" || raw === "broken-config" || raw === "engine-locked") &&
+      (raw === "broken-db" || raw === "broken-config" || raw === "engine-locked" || raw === "db-unreachable") &&
       hasRemoteOnlyGbrainMcp(env)
     ) {
       return "thin-client";
@@ -506,10 +600,15 @@ export function localEngineStatus(opts: ClassifyOptions = {}): LocalEngineStatus
 
   if (!opts.noCache) {
     const cached = readCache(key);
-    if (cached) return cached;
+    if (cached) {
+      lastDetail = cached.detail ?? null;
+      return cached.status;
+    }
   }
 
+  lastDetail = null;
   const fresh = freshClassify(env);
-  writeCache(fresh, key);
+  if (fresh !== "db-unreachable") lastDetail = null;
+  writeCache(fresh, key, lastDetail ?? undefined);
   return fresh;
 }

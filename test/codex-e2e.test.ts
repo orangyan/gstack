@@ -13,17 +13,15 @@
  * Skips gracefully when prerequisites are not met.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { runCodexSkill, parseCodexJSONL, installSkillToTempHome } from './helpers/codex-session-runner';
+import { describe, test, beforeAll, afterAll } from 'bun:test';
+import { JUDGE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
+import { runCodexSkill } from './helpers/codex-session-runner';
+import { CODEX_EVAL_FINALIZE_MS, createCodexEvalCollector, runRecordedCodexEval, validateCodexDiscovery, validateCodexReview } from './helpers/codex-eval';
 import type { CodexResult } from './helpers/codex-session-runner';
 import { CODEX_REVIEW_E2E_SECTIONS } from './helpers/skill-fixture';
-import { EvalCollector } from './helpers/eval-store';
-import type { EvalTestEntry } from './helpers/eval-store';
 import { selectTests, detectBaseBranch, getChangedFiles, E2E_TOUCHFILES, GLOBAL_TOUCHFILES } from './helpers/touchfiles';
 import { createTestWorktree, harvestAndCleanup } from './helpers/e2e-helpers';
-import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -31,7 +29,7 @@ const ROOT = path.resolve(import.meta.dir, '..');
 
 const CODEX_AVAILABLE = (() => {
   try {
-    const result = Bun.spawnSync(['which', 'codex']);
+    const result = Bun.spawnSync(['which', 'codex'], { timeout: 30_000 });
     return result.exitCode === 0;
   } catch { return false; }
 })();
@@ -62,11 +60,18 @@ if (!evalsEnabled) {
 
 // --- Diff-based test selection ---
 
-// Codex E2E touchfiles — keyed by test name, same pattern as E2E_TOUCHFILES
-const CODEX_E2E_TOUCHFILES: Record<string, string[]> = {
-  'codex-discover-skill':    ['codex/**', '.agents/skills/**', 'test/helpers/codex-session-runner.ts'],
-  'codex-review-findings':   ['review/**', '.agents/skills/gstack-review/**', 'codex/**', 'test/helpers/codex-session-runner.ts'],
-};
+// Codex E2E touchfiles — DERIVED from the canonical map, never a local fork.
+// The old hand-copy drifted (it kept gitignored '.agents/skills/**' patterns
+// that can never match a git diff, and missed deps the canonical map gained
+// like lib/worktree.ts and this test file itself), so review-template edits
+// silently stopped selecting these tests. Deriving keeps one source of truth
+// and puts these keys under the tier-alignment + dep-existence invariants.
+const CODEX_E2E_TOUCHFILES: Record<string, string[]> = Object.fromEntries(
+  (['codex-discover-skill', 'codex-review-findings'] as const).map((key) => {
+    if (!E2E_TOUCHFILES[key]) throw new Error(`canonical E2E_TOUCHFILES lost key '${key}' — fix the map, not this file`);
+    return [key, E2E_TOUCHFILES[key]];
+  }),
+);
 
 let selectedTests: string[] | null = null; // null = run all
 
@@ -91,27 +96,12 @@ if (evalsEnabled && !process.env.EVALS_ALL) {
 /** Skip an individual test if not selected by diff-based selection. */
 function testIfSelected(testName: string, fn: () => Promise<void>, timeout: number) {
   const shouldRun = selectedTests === null || selectedTests.includes(testName);
-  (shouldRun ? test.concurrent : test.skip)(testName, fn, timeout);
+  (shouldRun ? test.concurrent : test.skip)(testName, fn, timeout + CODEX_EVAL_FINALIZE_MS);
 }
 
 // --- Eval result collector ---
 
-const evalCollector = evalsEnabled && !SKIP ? new EvalCollector('e2e-codex') : null;
-
-/** DRY helper to record a Codex E2E test result into the eval collector. */
-function recordCodexE2E(name: string, result: CodexResult, passed: boolean) {
-  evalCollector?.addTest({
-    name,
-    suite: 'codex-e2e',
-    tier: 'e2e',
-    passed,
-    duration_ms: result.durationMs,
-    cost_usd: 0, // Codex doesn't report cost in the same way; tokens are tracked
-    output: result.output?.slice(0, 2000),
-    turns_used: result.toolCalls.length, // approximate: tool calls as turns
-    exit_reason: result.exitCode === 0 ? 'success' : `exit_code_${result.exitCode}`,
-  });
-}
+const evalCollector = evalsEnabled && !SKIP ? createCodexEvalCollector('codex-e2e') : null;
 
 /** Print cost summary after a Codex E2E test. */
 function logCodexCost(label: string, result: CodexResult) {
@@ -147,35 +137,26 @@ describeCodex('Codex E2E', () => {
     // meaningless against an extracted fixture.
     const skillDir = path.join(testWorktree, '.agents', 'skills', 'gstack-review');
 
-    const result = await runCodexSkill({
-      skillDir,
-      prompt: 'List any skills or instructions you have available. Just list the names.',
-      timeoutMs: 60_000,
-      cwd: testWorktree,
-      skillName: 'gstack-review',
+    const result = await runRecordedCodexEval({
+      name: 'codex-discover-skill',
+      suite: 'codex-e2e',
+      budgetMs: JUDGE_MS,
+      run: (signal) => runCodexSkill({
+        skillDir,
+        prompt: 'List any skills or instructions you have available. Just list the names.',
+        timeoutMs: JUDGE_MS,
+        cwd: testWorktree,
+        skillName: 'gstack-review',
+        signal,
+      }),
+      validate: validateCodexDiscovery,
+      record: (entry) => evalCollector?.addTest(entry),
     });
-
     logCodexCost('codex-discover-skill', result);
-
-    // Codex should have produced some output
-    const passed = result.exitCode === 0 && result.output.length > 0;
-    recordCodexE2E('codex-discover-skill', result, passed);
-
-    expect(result.exitCode).toBe(0);
-    expect(result.output.length).toBeGreaterThan(0);
-    // Skill loading errors mean our generated SKILL.md files are broken
-    expect(result.stderr).not.toContain('invalid');
-    expect(result.stderr).not.toContain('Skipped loading');
-    // The output should reference the skill name in some form
-    const outputLower = result.output.toLowerCase();
-    expect(
-      outputLower.includes('review') || outputLower.includes('gstack') || outputLower.includes('skill'),
-    ).toBe(true);
-  }, 120_000);
+  }, JUDGE_MS);
 
   // Validates that Codex can invoke the gstack-review skill, run a diff-based
   // code review, and produce structured review output with findings/issues.
-  // Accepts Codex timeout (exit 124/137) as non-failure since that's a CLI perf issue.
   testIfSelected('codex-review-findings', async () => {
     // Install gstack-review and ask Codex to review the worktree. The skill
     // fixture is EXTRACTED to the core review-workflow sections — the full
@@ -183,46 +164,22 @@ describeCodex('Codex E2E', () => {
     // diff-review flow (CLAUDE.md: "E2E test fixtures: extract, don't copy").
     const skillDir = path.join(testWorktree, '.agents', 'skills', 'gstack-review');
 
-    const result = await runCodexSkill({
-      skillDir,
-      prompt: 'Run the gstack-review skill on this repository. Review the current branch diff and report your findings.',
-      timeoutMs: 540_000,
-      cwd: testWorktree,
-      skillName: 'gstack-review',
-      sections: CODEX_REVIEW_E2E_SECTIONS,
+    const result = await runRecordedCodexEval({
+      name: 'codex-review-findings',
+      suite: 'codex-e2e',
+      budgetMs: CAPTURE_LONG_MS,
+      run: (signal) => runCodexSkill({
+        skillDir,
+        prompt: 'Run the gstack-review skill on this repository. Review the current branch diff and report your findings.',
+        timeoutMs: CAPTURE_LONG_MS,
+        cwd: testWorktree,
+        skillName: 'gstack-review',
+        sections: CODEX_REVIEW_E2E_SECTIONS,
+        signal,
+      }),
+      validate: validateCodexReview,
+      record: (entry) => evalCollector?.addTest(entry),
     });
-
     logCodexCost('codex-review-findings', result);
-
-    // Should produce structured review-like output
-    const output = result.output;
-
-    // Codex may time out on large diffs — accept timeout as "not our fault"
-    // exitCode 124 = killed by timeout, which is a Codex CLI performance issue
-    if (result.exitCode === 124 || result.exitCode === 137) {
-      console.warn(`codex-review-findings: Codex timed out (exit ${result.exitCode}) — skipping assertions`);
-      recordCodexE2E('codex-review-findings', result, true); // don't fail the suite
-      return;
-    }
-
-    const passed = result.exitCode === 0 && output.length > 50;
-    recordCodexE2E('codex-review-findings', result, passed);
-
-    expect(result.exitCode).toBe(0);
-    expect(output.length).toBeGreaterThan(50);
-
-    // Review output should contain some review-like content
-    const outputLower = output.toLowerCase();
-    const hasReviewContent =
-      outputLower.includes('finding') ||
-      outputLower.includes('issue') ||
-      outputLower.includes('review') ||
-      outputLower.includes('change') ||
-      outputLower.includes('diff') ||
-      outputLower.includes('clean') ||
-      outputLower.includes('no issues') ||
-      outputLower.includes('p1') ||
-      outputLower.includes('p2');
-    expect(hasReviewContent).toBe(true);
-  }, 600_000);
+  }, CAPTURE_LONG_MS);
 });

@@ -9,8 +9,11 @@ import { describe, test, expect, afterAll } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { classifyState, VERSION_RE } from '../bin/gstack-version-bump';
+import { checkChangelog, normalizeChangelog, parseChangelog } from '../lib/changelog-check';
+import { EXIT } from '../lib/headless-artifacts';
+import { cleanup, makeFixtureRepo, makePr, readFile, restamp, runBin } from './helpers/restamp-fixture';
 
 const BIN = path.join(import.meta.dir, '..', 'bin', 'gstack-version-bump');
 
@@ -61,10 +64,10 @@ describe('write (FRESH bump)', () => {
   test('writes VERSION + package.json.version, preserving other pkg fields', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0.0', scripts: { t: 'y' } }, null, 2) + '\n');
-    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir, timeout: 30_000 }).toString();
     expect(JSON.parse(out)).toEqual({
       wrote: '1.1.0.0', packageJson: true, packageJsonPath: 'package.json',
-      packageJsonVersion: '1.1.0', packageLock: false,
+      packageJsonVersion: '1.1.0', packageLock: false, agentsDigest: null,
     });
     expect(fs.readFileSync(path.join(dir, 'VERSION'), 'utf-8').trim()).toBe('1.1.0.0');
     const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8'));
@@ -76,18 +79,34 @@ describe('write (FRESH bump)', () => {
 
   test('rejects a malformed version with exit 2', () => {
     let code = 0;
-    try { execFileSync('bun', [BIN, 'write', '--version', '1.2.3.4.5'], { cwd: dir, stdio: 'pipe' }); }
+    try { execFileSync('bun', [BIN, 'write', '--version', '1.2.3.4.5'], { cwd: dir, stdio: 'pipe', timeout: 30_000 }); }
     catch (e: any) { code = e.status; }
     expect(code).toBe(2);
+  });
+
+  test('--manifest-form full keeps a four-part manifest and its lockfile as written', () => {
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-full-'));
+    fs.writeFileSync(path.join(d2, 'VERSION'), '0.60.482.0\n');
+    fs.writeFileSync(path.join(d2, 'package.json'), JSON.stringify({ name: 'g', version: '0.60.482.0' }, null, 2) + '\n');
+    fs.writeFileSync(path.join(d2, 'package-lock.json'), JSON.stringify({ name: 'g', version: '0.60.482.0', lockfileVersion: 3, packages: { '': { version: '0.60.482.0' } } }, null, 2) + '\n');
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '0.60.483.0', '--manifest-form', 'full'], { cwd: d2, timeout: 30_000 }).toString());
+    expect(out.packageJsonVersion).toBe('0.60.483.0');
+    expect(JSON.parse(fs.readFileSync(path.join(d2, 'package.json'), 'utf-8')).version).toBe('0.60.483.0');
+    const lock = JSON.parse(fs.readFileSync(path.join(d2, 'package-lock.json'), 'utf-8'));
+    expect([lock.version, lock.packages[''].version]).toEqual(['0.60.483.0', '0.60.483.0']);
+    const bad = spawnSync('bun', [BIN, 'write', '--version', '0.60.484.0', '--manifest-form', 'wide'], { cwd: d2, timeout: 30_000 });
+    expect(bad.status).toBe(2);
+    expect(fs.readFileSync(path.join(d2, 'VERSION'), 'utf-8').trim()).toBe('0.60.483.0');
+    fs.rmSync(d2, { recursive: true, force: true });
   });
 
   test('VERSION-only repo (no package.json) writes just VERSION', () => {
     const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-noPkg-'));
     fs.writeFileSync(path.join(d2, 'VERSION'), '0.1.0.0\n');
-    const out = execFileSync('bun', [BIN, 'write', '--version', '0.2.0.0'], { cwd: d2 }).toString();
+    const out = execFileSync('bun', [BIN, 'write', '--version', '0.2.0.0'], { cwd: d2, timeout: 30_000 }).toString();
     expect(JSON.parse(out)).toEqual({
       wrote: '0.2.0.0', packageJson: false, packageJsonPath: null,
-      packageJsonVersion: null, packageLock: false,
+      packageJsonVersion: null, packageLock: false, agentsDigest: null,
     });
     expect(fs.readFileSync(path.join(d2, 'VERSION'), 'utf-8').trim()).toBe('0.2.0.0');
     fs.rmSync(d2, { recursive: true, force: true });
@@ -101,7 +120,7 @@ describe('repair (DRIFT_STALE_PKG)', () => {
   test('syncs package.json.version up to VERSION, no re-bump', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), '2.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.9.0.0' }, null, 2) + '\n');
-    const out = execFileSync('bun', [BIN, 'repair'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'repair'], { cwd: dir, timeout: 30_000 }).toString();
     expect(JSON.parse(out)).toEqual({
       repaired: '2.0.0.0', packageJsonPath: 'package.json', packageJsonVersion: '2.0.0',
     });
@@ -112,7 +131,7 @@ describe('repair (DRIFT_STALE_PKG)', () => {
   test('refuses to propagate an invalid VERSION (exit 2)', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), 'not-a-version\n');
     let code = 0;
-    try { execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe' }); }
+    try { execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe', timeout: 30_000 }); }
     catch (e: any) { code = e.status; }
     expect(code).toBe(2);
   });
@@ -131,10 +150,10 @@ describe('write/repair sync npm lockfiles (both version fields, #2567)', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, 'package-lock.json'), lock('1.0.0'));
-    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir, timeout: 30_000 }).toString();
     expect(JSON.parse(out)).toEqual({
       wrote: '1.1.0.0', packageJson: true, packageJsonPath: 'package.json',
-      packageJsonVersion: '1.1.0', packageLock: true,
+      packageJsonVersion: '1.1.0', packageLock: true, agentsDigest: null,
     });
     const l = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf-8'));
     expect(l.version).toBe('1.1.0');
@@ -146,7 +165,7 @@ describe('write/repair sync npm lockfiles (both version fields, #2567)', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), '2.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.9.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, 'package-lock.json'), lock('1.9.0'));
-    execFileSync('bun', [BIN, 'repair'], { cwd: dir });
+    execFileSync('bun', [BIN, 'repair'], { cwd: dir, timeout: 30_000 });
     const l = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf-8'));
     expect(l.version).toBe('2.0.0');
     expect(l.packages[''].version).toBe('2.0.0');
@@ -156,7 +175,7 @@ describe('write/repair sync npm lockfiles (both version fields, #2567)', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), '3.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '2.9.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, 'package-lock.json'), JSON.stringify({ name: 'x', version: '2.9.0', lockfileVersion: 1 }, null, 2) + '\n');
-    execFileSync('bun', [BIN, 'repair'], { cwd: dir });
+    execFileSync('bun', [BIN, 'repair'], { cwd: dir, timeout: 30_000 });
     const l = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf-8'));
     expect(l.version).toBe('3.0.0');
     expect(l.packages).toBeUndefined();
@@ -167,7 +186,7 @@ describe('write/repair sync npm lockfiles (both version fields, #2567)', () => {
     fs.writeFileSync(path.join(d2, 'VERSION'), '1.0.0.0\n');
     fs.writeFileSync(path.join(d2, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(d2, 'npm-shrinkwrap.json'), lock('1.0.0').replace('package-lock', 'npm-shrinkwrap'));
-    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: d2 }).toString();
+    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: d2, timeout: 30_000 }).toString();
     expect(JSON.parse(out).packageLock).toBe(true);
     const l = JSON.parse(fs.readFileSync(path.join(d2, 'npm-shrinkwrap.json'), 'utf-8'));
     expect(l.version).toBe('1.1.0');
@@ -183,7 +202,7 @@ describe('write/repair sync npm lockfiles (both version fields, #2567)', () => {
     fs.writeFileSync(path.join(d3, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(d3, 'package-lock.json'), '{ not json');
     let code = 0;
-    try { execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: d3, stdio: 'pipe' }); }
+    try { execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: d3, stdio: 'pipe', timeout: 30_000 }); }
     catch (e: any) { code = e.status; }
     expect(code).toBe(3);
     // VERSION was written before the failure — exactly the half-write the
@@ -198,26 +217,26 @@ describe('classify (idempotency over a real git base)', () => {
   afterAll(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* noop */ } });
 
   // Build a tiny repo with an "origin/main" carrying VERSION=1.0.0.0.
-  const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+  const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe', timeout: 30_000 });
   fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0.0' }, null, 2) + '\n');
   git('init', '-q', '-b', 'main');
   git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
   git('add', '-A'); git('commit', '-q', '-m', 'base');
   // Fake an "origin/main" remote-tracking ref pointing at this commit.
-  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir }).toString().trim();
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, timeout: 30_000 }).toString().trim();
   fs.mkdirSync(path.join(dir, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
   fs.writeFileSync(path.join(dir, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
 
   test('reports FRESH before any bump', () => {
-    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir, timeout: 30_000 }).toString();
     expect(JSON.parse(out).state).toBe('FRESH');
   });
 
   test('reports ALREADY_BUMPED after VERSION+pkg move together', () => {
     fs.writeFileSync(path.join(dir, 'VERSION'), '1.1.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.1.0.0' }, null, 2) + '\n');
-    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir, timeout: 30_000 }).toString();
     const parsed = JSON.parse(out);
     expect(parsed.state).toBe('ALREADY_BUMPED');
     expect(parsed.baseVersion).toBe('1.0.0.0');
@@ -246,17 +265,17 @@ describe('package.json as the version source (monorepo, 3-digit, #2501)', () => 
   fs.mkdirSync(path.join(dir, 'frontend'), { recursive: true });
   fs.writeFileSync(pkgAbs, JSON.stringify({ name: 'frontend', version: '0.99.2', private: true, scripts: { dev: 'next dev' } }, null, 2) + '\n');
 
-  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
-  execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: dir });
-  execFileSync('git', ['config', 'user.name', 't'], { cwd: dir });
-  execFileSync('git', ['add', '-A'], { cwd: dir });
-  execFileSync('git', ['commit', '-qm', 'v0.99.2 base'], { cwd: dir });
-  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir }).toString().trim();
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir, timeout: 30_000 });
+  execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: dir, timeout: 30_000 });
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: dir, timeout: 30_000 });
+  execFileSync('git', ['add', '-A'], { cwd: dir, timeout: 30_000 });
+  execFileSync('git', ['commit', '-qm', 'v0.99.2 base'], { cwd: dir, timeout: 30_000 });
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, timeout: 30_000 }).toString().trim();
   fs.mkdirSync(path.join(dir, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
   fs.writeFileSync(path.join(dir, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
 
   test('classify reads the real version from the package.json version-path', () => {
-    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main', '--version-path', pkgRel], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main', '--version-path', pkgRel], { cwd: dir, timeout: 30_000 }).toString();
     const parsed = JSON.parse(out);
     expect(parsed.state).toBe('FRESH');
     expect(parsed.baseVersion).toBe('0.99.2');    // was "0.0.0.0"
@@ -265,8 +284,8 @@ describe('package.json as the version source (monorepo, 3-digit, #2501)', () => 
   });
 
   test('write updates the package.json in place and creates no VERSION file', () => {
-    const out = execFileSync('bun', [BIN, 'write', '--version', '0.99.3', '--version-path', pkgRel], { cwd: dir }).toString();
-    expect(JSON.parse(out)).toEqual({ wrote: '0.99.3', versionPath: pkgRel, packageJson: true, packageLock: false });
+    const out = execFileSync('bun', [BIN, 'write', '--version', '0.99.3', '--version-path', pkgRel], { cwd: dir, timeout: 30_000 }).toString();
+    expect(JSON.parse(out)).toEqual({ wrote: '0.99.3', versionPath: pkgRel, packageJson: true, packageLock: false, agentsDigest: null });
     const pkg = JSON.parse(fs.readFileSync(pkgAbs, 'utf-8'));
     expect(pkg.version).toBe('0.99.3');
     expect(pkg.scripts).toEqual({ dev: 'next dev' }); // rest of the file untouched
@@ -275,7 +294,7 @@ describe('package.json as the version source (monorepo, 3-digit, #2501)', () => 
   });
 
   test('classify reports ALREADY_BUMPED after that write, not a drift state', () => {
-    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main', '--version-path', pkgRel], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main', '--version-path', pkgRel], { cwd: dir, timeout: 30_000 }).toString();
     const parsed = JSON.parse(out);
     expect(parsed.state).toBe('ALREADY_BUMPED');
     expect(parsed.baseVersion).toBe('0.99.2');
@@ -283,14 +302,14 @@ describe('package.json as the version source (monorepo, 3-digit, #2501)', () => 
   });
 
   test('repair is a no-op: there is no second file to drift from', () => {
-    const out = execFileSync('bun', [BIN, 'repair', '--version-path', pkgRel], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'repair', '--version-path', pkgRel], { cwd: dir, timeout: 30_000 }).toString();
     expect(JSON.parse(out).repaired).toBeNull();
   });
 
   test('write refuses a version-path that does not exist', () => {
     let code = 0;
     try {
-      execFileSync('bun', [BIN, 'write', '--version', '1.0.0', '--version-path', 'nope/package.json'], { cwd: dir, stdio: 'pipe' });
+      execFileSync('bun', [BIN, 'write', '--version', '1.0.0', '--version-path', 'nope/package.json'], { cwd: dir, stdio: 'pipe', timeout: 30_000 });
     } catch (e: any) { code = e.status; }
     expect(code).toBe(2);
   });
@@ -315,12 +334,12 @@ describe('.gstack/version-path pin, no --version-path flag (#2462)', () => {
   };
 
   const commitBase = (d: string): void => {
-    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: d });
-    execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: d });
-    execFileSync('git', ['config', 'user.name', 't'], { cwd: d });
-    execFileSync('git', ['add', '-A'], { cwd: d });
-    execFileSync('git', ['commit', '-qm', 'base'], { cwd: d });
-    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: d }).toString().trim();
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['config', 'user.name', 't'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['add', '-A'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['commit', '-qm', 'base'], { cwd: d, timeout: 30_000 });
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: d, timeout: 30_000 }).toString().trim();
     fs.mkdirSync(path.join(d, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
     fs.writeFileSync(path.join(d, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
   };
@@ -332,7 +351,7 @@ describe('.gstack/version-path pin, no --version-path flag (#2462)', () => {
     commitBase(d);
     // Move the pinned file past base — NO root VERSION file exists at all.
     fs.writeFileSync(path.join(d, pinRel), '1.5.0.0\n');
-    const out = JSON.parse(execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: d }).toString());
+    const out = JSON.parse(execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: d, timeout: 30_000 }).toString());
     // Before the fix: baseVersion read root VERSION → "0.0.0.0" and the
     // branch misclassified as... current 1.5.0.0 vs base 0.0.0.0. The REAL
     // base is the pinned file's committed value.
@@ -347,7 +366,7 @@ describe('.gstack/version-path pin, no --version-path flag (#2462)', () => {
     const d = mkPinned(pinRel);
     fs.writeFileSync(path.join(d, pinRel), JSON.stringify({ name: 'f', version: '0.99.2' }, null, 2) + '\n');
     commitBase(d);
-    const out = JSON.parse(execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: d }).toString());
+    const out = JSON.parse(execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: d, timeout: 30_000 }).toString());
     // Before the fix: versionRel="VERSION" → the pinned JSON was read as raw
     // text → currentVersion "0.0.0.0", pkgExists false, base from a
     // nonexistent root VERSION.
@@ -362,8 +381,8 @@ describe('.gstack/version-path pin, no --version-path flag (#2462)', () => {
     const pinRel = 'frontend/package.json';
     const d = mkPinned(pinRel);
     fs.writeFileSync(path.join(d, pinRel), JSON.stringify({ name: 'f', version: '0.99.2' }, null, 2) + '\n');
-    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '0.99.3'], { cwd: d }).toString());
-    expect(out).toEqual({ wrote: '0.99.3', versionPath: pinRel, packageJson: true, packageLock: false });
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '0.99.3'], { cwd: d, timeout: 30_000 }).toString());
+    expect(out).toEqual({ wrote: '0.99.3', versionPath: pinRel, packageJson: true, packageLock: false, agentsDigest: null });
     expect(JSON.parse(fs.readFileSync(path.join(d, pinRel), 'utf-8')).version).toBe('0.99.3');
     // Before the fix, write treated versionRel as "VERSION" and overwrote the
     // pinned JSON file with a bare "0.99.3\n", destroying the manifest.
@@ -375,7 +394,7 @@ describe('.gstack/version-path pin, no --version-path flag (#2462)', () => {
     const pinRel = 'frontend/package.json';
     const d = mkPinned(pinRel);
     fs.writeFileSync(path.join(d, pinRel), JSON.stringify({ name: 'f', version: '0.99.2' }, null, 2) + '\n');
-    const out = JSON.parse(execFileSync('bun', [BIN, 'repair'], { cwd: d }).toString());
+    const out = JSON.parse(execFileSync('bun', [BIN, 'repair'], { cwd: d, timeout: 30_000 }).toString());
     expect(out.repaired).toBeNull();
     fs.rmSync(d, { recursive: true, force: true });
   });
@@ -386,7 +405,7 @@ describe('.gstack/version-path pin, no --version-path flag (#2462)', () => {
     fs.writeFileSync(path.join(d, 'OTHER_VERSION'), '2.0.0.0\n');
     commitBase(d);
     const out = JSON.parse(
-      execFileSync('bun', [BIN, 'classify', '--base', 'main', '--version-path', 'OTHER_VERSION'], { cwd: d }).toString(),
+      execFileSync('bun', [BIN, 'classify', '--base', 'main', '--version-path', 'OTHER_VERSION'], { cwd: d, timeout: 30_000 }).toString(),
     );
     expect(out.currentVersion).toBe('2.0.0.0');
     expect(out.baseVersion).toBe('2.0.0.0');
@@ -414,7 +433,7 @@ describe('subdirectory manifest (no root package.json, #2531)', () => {
     const d = mk();
     fs.writeFileSync(path.join(d, 'web', 'package.json'),
       JSON.stringify({ name: 'w', version: '0.1.0' }, null, 2) + '\n');
-    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '0.2.0.0'], { cwd: d }).toString());
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '0.2.0.0'], { cwd: d, timeout: 30_000 }).toString());
     expect(out.packageJson).toBe(true);
     expect(out.packageJsonPath).toBe('web/package.json');
     expect(out.packageJsonVersion).toBe('0.2.0');
@@ -428,7 +447,7 @@ describe('subdirectory manifest (no root package.json, #2531)', () => {
     fs.writeFileSync(path.join(d, 'web', 'package.json'), JSON.stringify({ version: '0.1.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(d, 'app', 'package.json'), JSON.stringify({ version: '0.1.0' }, null, 2) + '\n');
     const out = JSON.parse(execFileSync('bun',
-      [BIN, 'write', '--version', '0.3.0.0', '--package-json-path', 'app/package.json'], { cwd: d }).toString());
+      [BIN, 'write', '--version', '0.3.0.0', '--package-json-path', 'app/package.json'], { cwd: d, timeout: 30_000 }).toString());
     expect(out.packageJsonPath).toBe('app/package.json');
     expect(JSON.parse(fs.readFileSync(path.join(d, 'app', 'package.json'), 'utf-8')).version).toBe('0.3.0');
     // the pinned one is untouched
@@ -440,16 +459,16 @@ describe('subdirectory manifest (no root package.json, #2531)', () => {
     const d = mk();
     fs.writeFileSync(path.join(d, 'web', 'package.json'),
       JSON.stringify({ name: 'w', version: '0.1.0' }, null, 2) + '\n');
-    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: d });
-    execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: d });
-    execFileSync('git', ['config', 'user.name', 't'], { cwd: d });
-    execFileSync('git', ['add', '-A'], { cwd: d });
-    execFileSync('git', ['commit', '-qm', 'base'], { cwd: d });
-    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: d }).toString().trim();
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['config', 'user.name', 't'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['add', '-A'], { cwd: d, timeout: 30_000 });
+    execFileSync('git', ['commit', '-qm', 'base'], { cwd: d, timeout: 30_000 });
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: d, timeout: 30_000 }).toString().trim();
     fs.mkdirSync(path.join(d, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
     fs.writeFileSync(path.join(d, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
 
-    const out = JSON.parse(execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: d }).toString());
+    const out = JSON.parse(execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: d, timeout: 30_000 }).toString());
     // 0.1.0 IS the npm-valid translation of 0.1.0.0 — in sync, no drift.
     expect(out.state).toBe('FRESH');
     expect(out.pkgExists).toBe(true);
@@ -462,7 +481,7 @@ describe('subdirectory manifest (no root package.json, #2531)', () => {
     const d = mk();
     fs.writeFileSync(path.join(d, 'web', 'package.json'),
       JSON.stringify({ name: 'w', version: '0.0.9' }, null, 2) + '\n');
-    const out = JSON.parse(execFileSync('bun', [BIN, 'repair'], { cwd: d }).toString());
+    const out = JSON.parse(execFileSync('bun', [BIN, 'repair'], { cwd: d, timeout: 30_000 }).toString());
     expect(out).toEqual({ repaired: '0.1.0.0', packageJsonPath: 'web/package.json', packageJsonVersion: '0.1.0' });
     expect(JSON.parse(fs.readFileSync(path.join(d, 'web', 'package.json'), 'utf-8')).version).toBe('0.1.0');
     fs.rmSync(d, { recursive: true, force: true });
@@ -504,7 +523,7 @@ describe('path containment: pins and flags cannot escape the repo', () => {
 
   function runFail(args: string[]): { code: number; stderr: string } {
     try {
-      execFileSync('bun', [BIN, ...args], { cwd: dir, stdio: 'pipe' });
+      execFileSync('bun', [BIN, ...args], { cwd: dir, stdio: 'pipe', timeout: 30_000 });
       return { code: 0, stderr: '' };
     } catch (e: any) {
       return { code: e.status, stderr: (e.stderr || '').toString() };
@@ -562,7 +581,7 @@ describe('path containment: pins and flags cannot escape the repo', () => {
     fs.writeFileSync(outerLock, JSON.stringify({ version: '1.0.0', packages: { '': { version: '1.0.0' } } }, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0' }, null, 2) + '\n');
     fs.symlinkSync(outerLock, path.join(dir, 'package-lock.json'));
-    const res = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir, stdio: 'pipe' });
+    const res = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir, stdio: 'pipe', timeout: 30_000 });
     expect(JSON.parse(res.toString()).packageLock).toBe(false);
     expect(JSON.parse(fs.readFileSync(outerLock, 'utf-8')).version).toBe('1.0.0');
   });
@@ -572,7 +591,7 @@ describe('path containment: pins and flags cannot escape the repo', () => {
     fs.mkdirSync(path.join(dir, 'frontend'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'frontend', 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0' }, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, '.gstack', 'version-path'), 'frontend/package.json\n');
-    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'write', '--version', '1.1.0'], { cwd: dir, timeout: 30_000 }).toString();
     expect(JSON.parse(out).wrote).toBe('1.1.0');
     expect(JSON.parse(fs.readFileSync(path.join(dir, 'frontend', 'package.json'), 'utf-8')).version).toBe('1.1.0');
   });
@@ -602,7 +621,7 @@ describe('#2600: repair must not write fabricated 0.0.0.0 when VERSION is missin
     let code = 0;
     let stderr = '';
     try {
-      execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe' });
+      execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe', timeout: 30_000 });
     } catch (e: any) {
       code = e.status;
       stderr = (e.stderr || '').toString();
@@ -621,7 +640,7 @@ describe('#2600: repair must not write fabricated 0.0.0.0 when VERSION is missin
     fs.writeFileSync(path.join(dir, 'VERSION'), '2.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '1.9.0' }, null, 2) + '\n');
 
-    const out = execFileSync('bun', [BIN, 'repair'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'repair'], { cwd: dir, timeout: 30_000 }).toString();
     const result = JSON.parse(out);
 
     expect(result.repaired).toBe('2.0.0.0');
@@ -639,7 +658,7 @@ describe('#2600: repair must not write fabricated 0.0.0.0 when VERSION is missin
     let code = 0;
     let stderr = '';
     try {
-      execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe' });
+      execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe', timeout: 30_000 });
     } catch (e: any) {
       code = e.status;
       stderr = (e.stderr || '').toString();
@@ -660,7 +679,7 @@ describe('#2600: repair must not write fabricated 0.0.0.0 when VERSION is missin
     fs.writeFileSync(path.join(dir, 'VERSION'), '0.0.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '0.5.0' }, null, 2) + '\n');
 
-    const out = execFileSync('bun', [BIN, 'repair'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'repair'], { cwd: dir, timeout: 30_000 }).toString();
     const result = JSON.parse(out);
     expect(result.repaired).toBe('0.0.0.0');
     expect(result.packageJsonVersion).toBe('0.0.0');
@@ -673,7 +692,7 @@ describe('#2600: repair must not write fabricated 0.0.0.0 when VERSION is missin
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '0.5.0' }, null, 2) + '\n');
 
     let code = 0;
-    try { execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe' }); }
+    try { execFileSync('bun', [BIN, 'repair'], { cwd: dir, stdio: 'pipe', timeout: 30_000 }); }
     catch (e: any) { code = e.status; }
     expect(code).toBe(2);
     expect(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8')).version).toBe('0.5.0');
@@ -692,7 +711,7 @@ describe('#2600: repair must not write fabricated 0.0.0.0 when VERSION is missin
     let code = 0;
     let stderr = '';
     try {
-      execFileSync('bun', [BIN, 'repair'], { cwd: path.join(rootDir, 'app'), stdio: 'pipe' });
+      execFileSync('bun', [BIN, 'repair'], { cwd: path.join(rootDir, 'app'), stdio: 'pipe', timeout: 30_000 });
     } catch (e: any) {
       code = e.status;
       stderr = (e.stderr || '').toString();
@@ -717,13 +736,13 @@ describe('#2600: classify must surface versionFileExists=false when VERSION is m
   function makeRepoDir(): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-2600-classify-'));
     dirs.push(dir);
-    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe', timeout: 30_000 });
     git('init', '-q', '-b', 'main');
     git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
     // Commit with no VERSION file
     fs.writeFileSync(path.join(dir, 'README.md'), 'test\n');
     git('add', '-A'); git('commit', '-q', '-m', 'base');
-    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir }).toString().trim();
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, timeout: 30_000 }).toString().trim();
     fs.mkdirSync(path.join(dir, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
     return dir;
@@ -734,12 +753,14 @@ describe('#2600: classify must surface versionFileExists=false when VERSION is m
     // No package.json: pkgExists=false, pkgAgrees=true, current===base → FRESH.
     // (A package.json with a non-zero version would cause DRIFT_UNEXPECTED.)
 
-    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir, timeout: 30_000 }).toString();
     const result = JSON.parse(out);
 
+    // G1 (#2334/#2343) deliberately replaced the fabricated 0.0.0.0 / FRESH
+    // classification: no configured version source is its own state.
     expect(result.versionFileExists).toBe(false);
-    expect(result.currentVersion).toBe('0.0.0.0'); // fabricated default
-    expect(result.state).toBe('FRESH'); // base also reads 0.0.0.0, no pkg drift
+    expect(result.currentVersion).toBeNull();
+    expect(result.state).toBe('NO_VERSION');
   });
 
   test('classify reports versionFileExists=true when VERSION is present', () => {
@@ -748,7 +769,7 @@ describe('#2600: classify must surface versionFileExists=false when VERSION is m
     fs.writeFileSync(path.join(dir, 'VERSION'), '0.2.0.0\n');
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '0.2.0.0' }, null, 2) + '\n');
 
-    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir }).toString();
+    const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir, timeout: 30_000 }).toString();
     const result = JSON.parse(out);
 
     expect(result.versionFileExists).toBe(true);
@@ -756,3 +777,319 @@ describe('#2600: classify must surface versionFileExists=false when VERSION is m
     expect(result.state).toBe('ALREADY_BUMPED'); // base is 0.0.0.0, current is 0.2.0.0, pkg in sync
   });
 });
+
+describe('write --regen-digest regenerates the gstack agents digest (explicit opt-in)', () => {
+  // The committed agents-digest/gstack-AGENTS.md embeds VERSION in its first
+  // line and is byte-freshness-gated (test/agents-digest.test.ts + the Skill
+  // Docs Freshness CI check). The write that changes VERSION must regenerate
+  // it in the same mutation or every release commit of THIS repo goes red.
+  // The regen runs the TARGET repo's generator, which is code execution —
+  // hence the explicit flag: a plain `write` in a hostile clone must never
+  // execute repo files it merely finds on disk.
+  const stubGenerator = (dir: string) => {
+    fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'agents-digest'), { recursive: true });
+    // Stub with the same shape as scripts/gen-agents-digest.ts: read VERSION,
+    // write the version-stamped digest.
+    fs.writeFileSync(path.join(dir, 'scripts', 'gen-agents-digest.ts'), [
+      "import * as fs from 'fs';",
+      "import * as path from 'path';",
+      "const root = path.resolve(import.meta.dir, '..');",
+      "const v = fs.readFileSync(path.join(root, 'VERSION'), 'utf-8').trim();",
+      "fs.writeFileSync(path.join(root, 'agents-digest', 'gstack-AGENTS.md'), `# gstack digest v${v}\\n`);",
+    ].join('\n'));
+    fs.writeFileSync(path.join(dir, 'agents-digest', 'gstack-AGENTS.md'), '# gstack digest v1.0.0.0\n');
+  };
+
+  test('with the flag: a repo with the generator + committed digest gets a fresh digest', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-digest-'));
+    fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
+    stubGenerator(dir);
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0', '--regen-digest'], { cwd: dir, timeout: 30_000 }).toString());
+    expect(out.agentsDigest).toBe(true);
+    expect(fs.readFileSync(path.join(dir, 'agents-digest', 'gstack-AGENTS.md'), 'utf-8'))
+      .toBe('# gstack digest v1.1.0.0\n');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('WITHOUT the flag: the generator is never executed, even when present (no presence-sniffed code exec)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-digest-noflag-'));
+    fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
+    stubGenerator(dir);
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0'], { cwd: dir, timeout: 30_000 }).toString());
+    expect(out.agentsDigest).toBe(null);
+    // Digest untouched — the stub would have stamped v1.1.0.0 had it run.
+    expect(fs.readFileSync(path.join(dir, 'agents-digest', 'gstack-AGENTS.md'), 'utf-8'))
+      .toBe('# gstack digest v1.0.0.0\n');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('a generator failure warns and reports agentsDigest:false without failing the bump', () => {
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-digest-fail-'));
+    fs.writeFileSync(path.join(d2, 'VERSION'), '1.0.0.0\n');
+    fs.mkdirSync(path.join(d2, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(d2, 'agents-digest'), { recursive: true });
+    fs.writeFileSync(path.join(d2, 'scripts', 'gen-agents-digest.ts'), 'process.exit(1);\n');
+    fs.writeFileSync(path.join(d2, 'agents-digest', 'gstack-AGENTS.md'), '# gstack digest v1.0.0.0\n');
+
+    const res = execFileSync('bun', [BIN, 'write', '--version', '1.1.0.0', '--regen-digest'], { cwd: d2, stdio: 'pipe', timeout: 30_000 });
+    const out = JSON.parse(res.toString());
+    expect(out.wrote).toBe('1.1.0.0'); // the bump itself still lands
+    expect(out.agentsDigest).toBe(false);
+    fs.rmSync(d2, { recursive: true, force: true });
+  });
+
+  test('the REAL generator round-trips a bump: write --regen-digest restamps the digest first line', () => {
+    // Not a stub: copy the actual generator + digest into a temp repo, bump
+    // it, and confirm the regenerated first line tracks the new VERSION.
+    const root = path.join(import.meta.dir, '..');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-digest-real-'));
+    fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'agents-digest'), { recursive: true });
+    fs.copyFileSync(
+      path.join(root, 'scripts', 'gen-agents-digest.ts'),
+      path.join(dir, 'scripts', 'gen-agents-digest.ts'),
+    );
+    fs.copyFileSync(
+      path.join(root, 'agents-digest', 'gstack-AGENTS.md'),
+      path.join(dir, 'agents-digest', 'gstack-AGENTS.md'),
+    );
+    fs.writeFileSync(path.join(dir, 'VERSION'), '9.9.9.9\n');
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '9.9.10.0', '--regen-digest'], { cwd: dir, timeout: 30_000 }).toString());
+    expect(out.agentsDigest).toBe(true);
+    const first = fs.readFileSync(path.join(dir, 'agents-digest', 'gstack-AGENTS.md'), 'utf-8').split('\n')[0];
+    expect(first).toContain('v9.9.10.0');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+/**
+ * G1 (#2334, #2343): four resolution outcomes. Most repos /ship runs in have
+ * no VERSION file. Before, classify folded "no file" into 0.0.0.0 — a repo
+ * with a real package.json version then hit DRIFT_UNEXPECTED (VERSION "equals"
+ * base at 0.0.0.0 while package.json disagrees) and /ship stopped, and a repo
+ * without one classified FRESH and had a VERSION file invented. A pinned file
+ * that was missing or malformed read as 0.0.0.0 too.
+ */
+describe('G1: version source outcomes (absent / valid / ambiguous / broken)', () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) { try { fs.chmodSync(d, 0o755); fs.rmSync(d, { recursive: true, force: true }); } catch { /* noop */ } }
+  });
+
+  function repo(files: Record<string, string>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-g1-'));
+    dirs.push(dir);
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe', timeout: 30_000 });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'x\n');
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), body);
+    }
+    git('add', '-A'); git('commit', '-q', '-m', 'base');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, timeout: 30_000 }).toString().trim();
+    fs.mkdirSync(path.join(dir, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
+    return dir;
+  }
+
+  function run(dir: string, args: string[]): { code: number; stdout: string; stderr: string } {
+    try {
+      const stdout = execFileSync('bun', [BIN, ...args], { cwd: dir, stdio: 'pipe', timeout: 30_000 }).toString();
+      return { code: 0, stdout, stderr: '' };
+    } catch (e: any) {
+      return { code: e.status, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') };
+    }
+  }
+
+  const NOTICE =
+    'Shipped without a version change: no version source is configured (no VERSION file, no .gstack/version-path). ' +
+    "To version releases, create VERSION or write the version file's path (for example package.json) to .gstack/version-path.";
+
+  test('versionless app with a real package.json version: NO_VERSION + exact notice, not DRIFT_UNEXPECTED', () => {
+    const dir = repo({ 'package.json': JSON.stringify({ name: 'app', version: '2.3.4' }, null, 2) + '\n' });
+    const r = run(dir, ['classify', '--base', 'main']);
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.state).toBe('NO_VERSION');
+    expect(out.versionSource.outcome).toBe('absent');
+    expect(out.notice).toBe(NOTICE);
+    expect(out.currentVersion).toBeNull();
+    expect(out.baseVersion).toBeNull();
+  });
+
+  test('write in a versionless repo refuses and never creates VERSION', () => {
+    const dir = repo({ 'package.json': JSON.stringify({ name: 'app', version: '2.3.4' }, null, 2) + '\n' });
+    const r = run(dir, ['write', '--version', '0.0.1.0']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('Shipped without a version change');
+    expect(fs.existsSync(path.join(dir, 'VERSION'))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8')).version).toBe('2.3.4');
+  });
+
+  const ambiguous: Array<[string, Record<string, string>, string]> = [
+    ['monorepo (pnpm workspace)', { 'pnpm-workspace.yaml': 'packages:\n  - apps/*\n', 'apps/web/package.json': '{"name":"web","version":"1.0.0"}' }, 'monorepo'],
+    ['monorepo (package.json workspaces)', { 'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }) }, 'monorepo'],
+    ['release-please', { 'release-please-config.json': '{}', '.release-please-manifest.json': '{".":"1.4.0"}', 'package.json': '{"name":"a","version":"1.4.0"}' }, 'release-please'],
+    ['semantic-release placeholder', { 'package.json': JSON.stringify({ name: 'a', version: '0.0.0-development' }) }, 'placeholder'],
+  ];
+  for (const [name, files, reason] of ambiguous) {
+    test(`ambiguous: ${name} ships without a version and says why`, () => {
+      const dir = repo(files);
+      const r = run(dir, ['classify', '--base', 'main']);
+      expect(r.code).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect(out.state).toBe('NO_VERSION');
+      expect(out.versionSource.outcome).toBe('ambiguous');
+      expect(out.versionSource.reason).toContain(reason);
+      expect(out.notice).toContain('Shipped without a version change');
+      expect(out.notice).toContain(out.versionSource.reason);
+    });
+  }
+
+  test('valid: a package.json pinned in .gstack/version-path is used', () => {
+    const dir = repo({
+      '.gstack/version-path': 'package.json\n',
+      'package.json': JSON.stringify({ name: 'app', version: '2.3.4' }, null, 2) + '\n',
+    });
+    const out = JSON.parse(run(dir, ['classify', '--base', 'main']).stdout);
+    expect(out.state).toBe('FRESH');
+    expect(out.versionSource.outcome).toBe('valid');
+    expect(out.currentVersion).toBe('2.3.4');
+  });
+
+  const brokenPins: Array<[string, Record<string, string>, string]> = [
+    ['missing', { '.gstack/version-path': 'apps/web/package.json\n' }, 'apps/web/package.json does not exist'],
+    ['empty', { '.gstack/version-path': 'VERSION.txt\n', 'VERSION.txt': '\n' }, 'VERSION.txt is empty'],
+    ['malformed JSON', { '.gstack/version-path': 'package.json\n', 'package.json': '{ not json' }, 'package.json contains no parsable version'],
+    ['malformed text', { 'VERSION': 'release-candidate\n' }, 'VERSION contains no parsable version'],
+    ['unreadable (a directory)', { '.gstack/version-path': 'ver\n', 'ver/keep': '' }, 'ver is unreadable'],
+  ];
+  for (const [name, files, reason] of brokenPins) {
+    test(`broken pin (${name}) stops with the path and never reads as 0.0.0.0`, () => {
+      const dir = repo(files);
+      const r = run(dir, ['classify', '--base', 'main']);
+      expect(r.code).toBe(2);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toContain(reason);
+      expect(r.stderr).toContain('never substitutes 0.0.0.0');
+      const w = run(dir, ['write', '--version', '1.0.0.0']);
+      expect(w.code).toBe(2);
+      expect(w.stderr).toContain(reason);
+    });
+  }
+});
+
+describe('write --changelog re-heads [Unreleased] (opt-in, restamp-compatible)', () => {
+  const dirs: string[] = [];
+  afterAll(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true }); });
+  const RELEASED = '## [1.0.0.0] - 2026-10-01\n\n- first release\n';
+  const ENTRY = '## [Unreleased]\n\n### Fixed\n- the branch change\n';
+  const repo = (changelog: string | null) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-changelog-'));
+    dirs.push(dir);
+    fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
+    if (changelog !== null) fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog);
+    return dir;
+  };
+  const run = (dir: string, args: string[]) => {
+    const r = spawnSync('bun', [BIN, 'write', ...args], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
+    return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const today = () => new Date().toISOString().slice(0, 10);
+  const readCl = (dir: string) => fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
+
+  test('without the flag write leaves [Unreleased] and the output shape unchanged', () => {
+    const before = `# Changelog\n\n${ENTRY}\n${RELEASED}`;
+    const dir = repo(before);
+    const r = run(dir, ['--version', '1.0.1.0']);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout)).not.toHaveProperty('changelog');
+    expect(readCl(dir)).toBe(before);
+  });
+
+  test('re-heads [Unreleased] to the written version, dated today (UTC), keeping every other byte', () => {
+    const before = `# Changelog\n\n${ENTRY}\n${RELEASED}`;
+    const dir = repo(before);
+    const d0 = today();
+    const r = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    const d1 = today();
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout).changelog).toEqual({ path: 'CHANGELOG.md', moved: true, detail: 'Unreleased -> 1.0.1.0' });
+    const after = readCl(dir);
+    expect([d0, d1].map(d => `# Changelog\n\n## [1.0.1.0] - ${d}\n\n### Fixed\n- the branch change\n\n${RELEASED}`)).toContain(after);
+    expect(normalizeChangelog(after)).toBe(normalizeChangelog(before));
+    expect(checkChangelog(after, '1.0.1.0')).toEqual([]);
+  });
+
+  test('an [Unreleased] entry below the predecessor (after a main merge) moves to the top', () => {
+    const dir = repo(`# Changelog\n\n${RELEASED}\n${ENTRY}`);
+    expect(run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']).code).toBe(0);
+    const sections = parseChangelog(readCl(dir)).sections;
+    expect(sections.map(s => s.version)).toEqual(['1.0.1.0', '1.0.0.0']);
+    expect(sections[1]!.lines.join('\n').trimEnd()).toBe(RELEASED.trimEnd());
+  });
+
+  test('a rerun is a no-op, and a CHANGELOG with no [Unreleased] never has a released heading renamed', () => {
+    const dir = repo(`# Changelog\n\n${ENTRY}\n${RELEASED}`);
+    expect(run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']).code).toBe(0);
+    const once = readCl(dir);
+    const again = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    expect(JSON.parse(again.stdout).changelog).toEqual({ path: 'CHANGELOG.md', moved: false, detail: 'no [Unreleased] section' });
+    expect(readCl(dir)).toBe(once);
+    const released = repo(`# Changelog\n\n${RELEASED}`);
+    expect(run(released, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']).code).toBe(0);
+    expect(readCl(released)).toBe(`# Changelog\n\n${RELEASED}`);
+  });
+
+  test('an absent CHANGELOG is a no-op that creates nothing', () => {
+    const dir = repo(null);
+    const r = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout).changelog).toEqual({ path: 'CHANGELOG.md', moved: false, detail: 'CHANGELOG.md absent' });
+    expect(fs.existsSync(path.join(dir, 'CHANGELOG.md'))).toBe(false);
+  });
+
+  test('a heading the move would duplicate refuses with exit 2 before VERSION is written', () => {
+    const before = `# Changelog\n\n${ENTRY}\n## [1.0.1.0] - 2026-10-02\n\n- taken\n\n${RELEASED}`;
+    const dir = repo(before);
+    const r = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('1.0.1.0 already headed');
+    expect(fs.readFileSync(path.join(dir, 'VERSION'), 'utf8')).toBe('1.0.0.0\n');
+    expect(readCl(dir)).toBe(before);
+  });
+
+  test('a missing value or an escaping path refuses with exit 2 and writes nothing', () => {
+    const dir = repo(`# Changelog\n\n${ENTRY}`);
+    for (const args of [['--changelog'], ['--changelog', '--regen-digest'], ['--changelog', '../CHANGELOG.md']]) {
+      const r = run(dir, ['--version', '1.0.1.0', ...args]);
+      expect(r.code).toBe(2);
+      expect(fs.readFileSync(path.join(dir, 'VERSION'), 'utf8')).toBe('1.0.0.0\n');
+    }
+  });
+
+  test('gstack-restamp composes: an already re-headed entry is kept, and a later stamp moves it as the branch stamp', () => {
+    const fx = makeFixtureRepo({ prefix: 'vbump-restamp-' });
+    try {
+      makePr(fx, 'pr-a');
+      const w = runBin(fx, 'gstack-version-bump', ['write', '--version', '1.2.4.0', '--changelog', 'CHANGELOG.md']);
+      expect(w.status).toBe(0);
+      fx.git('commit', '-qam', 'bump 1.2.4.0');
+      const headed = readFile(fx, 'CHANGELOG.md');
+      const same = restamp(fx, ['--version', '1.2.4.0']);
+      expect(same.status).toBe(EXIT.ok);
+      expect(same.out).toContain('already headed 1.2.4.0');
+      expect(readFile(fx, 'CHANGELOG.md')).toBe(headed);
+      const next = restamp(fx, ['--version', '1.2.5.0']);
+      expect(next.status).toBe(EXIT.ok);
+      expect(next.out).toContain('1.2.4.0 -> 1.2.5.0');
+      expect(parseChangelog(readFile(fx, 'CHANGELOG.md')).sections.map(s => s.version)).toEqual(['1.2.5.0', '1.2.3.0', '1.2.2.0']);
+    } finally {
+      cleanup(fx);
+    }
+  });
+});
+

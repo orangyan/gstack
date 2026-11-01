@@ -42,6 +42,12 @@ const READ_PATTERNS: { name: string; re: RegExp }[] = [
 // (file, pattern-name) exemptions with reasons. Keep every entry REASONED.
 const SCANNER_EXEMPT: { file: string; pattern: string; reason: string }[] = [
   {
+    file: 'scripts/resolvers/plan-gates.ts',
+    pattern: 'gh pr body read',
+    reason:
+      'F1 plan binding: only the first `Plan: <path>` token survives (one whitespace-free path, CR and backticks stripped); the body never reaches model context, and the path is then read as a file the parent confirms',
+  },
+  {
     file: 'review/greptile-triage.md',
     pattern: 'gh comment-body api read',
     reason:
@@ -61,7 +67,7 @@ const SCANNER_EXEMPT: { file: string; pattern: string; reason: string }[] = [
 ];
 
 function trackedFiles(): string[] {
-  const out = execSync('git ls-files', { cwd: ROOT, encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 });
+  const out = execSync('git ls-files', { cwd: ROOT, encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024, timeout: 30_000 });
   return out
     .split('\n')
     .map((s) => s.trim())
@@ -129,8 +135,10 @@ describe('tracker-text wiring scanner', () => {
       'review/greptile-triage.md',
       'document-release/sections/release-body.md.tmpl',
       'spec/SKILL.md.tmpl',
-      'land-and-deploy/SKILL.md.tmpl',
-      'scripts/resolvers/review.ts',
+      // Carved: the pr-body trust-envelope read lives in Step 3.5c, which moved
+      // into the on-demand readiness-gate section.
+      'land-and-deploy/sections/readiness-gate.md.tmpl',
+      'scripts/resolvers/review-scope.ts',
     ];
     for (const rel of mustMention) {
       const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');

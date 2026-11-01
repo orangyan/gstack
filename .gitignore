@@ -8,7 +8,26 @@ make-pdf/dist/
 !lib/diagram-render/dist/
 !lib/diagram-render/dist/**
 bin/gstack-global-discover*
-.gstack/
+# Compiled CSO launcher, helper, and watchdog.
+bin/gstack-cso-launcher
+bin/gstack-cso-launcher.exe
+bin/gstack-cso-core
+bin/gstack-cso-core.exe
+bin/gstack-cso-watchdog
+bin/gstack-cso-watchdog.exe
+bin/.gstack-cso-stage.*
+bin/.gstack-cso-build.lock/
+bin/.gstack-cso-generation.lock
+bin/.gstack-cso-generation
+bin/.gstack-cso-build-result
+bin/.gstack-cso-build.log
+lib/cso/images/gstack-cso-verifier
+lib/cso/images/gstack-cso-preparation
+.gstack/*
+!.gstack/ship-policy.json
+!.gstack/ship-policy.example.json
+!.gstack/generated.json
+!.gstack/pregate.json
 .claude/skills/
 .claude/gstack-rendered/
 .claude/scheduled_tasks.lock
@@ -19,10 +38,14 @@ bin/gstack-global-discover*
 .opencode/
 .slate/
 .cursor/
+.copilot/
+.agy/
 .openclaw/
 .hermes/
 .gbrain/
 .gbrain-source
+# Hosts installed from this checkout (bin/gstack-host-renders.sh, #1694)
+.gstack-installed-hosts
 .context/
 extension/.auth.json
 # xterm assets are vendored from npm at build time; not source-of-truth.
@@ -46,6 +69,7 @@ docs/throughput-*.json
 .sources/
 
 # SPM build output from the gen-accessors tool (built in place by
-# skill-e2e-ios-swift-build; regenerates on every run — never commit)
+# test/ios-qa-swift-build.test.ts; regenerates on every run — never commit)
 ios-qa/scripts/gen-accessors-tool/.build/
 ios-qa/scripts/gen-accessors-tool/Package.resolved
+.gstack/
